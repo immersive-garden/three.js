@@ -53144,6 +53144,14 @@ class NodeBuilder {
 		this.flowsData = new WeakMap();
 
 		/**
+		 * Per-builder indices of buffer nodes, used to name buffer bindings
+		 * independently of global node ids.
+		 *
+		 * @type {Map<Node,number>}
+		 */
+		this.bufferIndices = new Map();
+
+		/**
 		 * The current shader stage.
 		 *
 		 * @type {?('vertex'|'fragment'|'compute'|'any')}
@@ -55979,6 +55987,29 @@ class NodeBuilder {
 		this.buildUpdateNodes();
 
 		return this;
+
+	}
+
+	/**
+	 * Returns a deterministic per-builder index for the given buffer node, assigned on first
+	 * request. Identical graphs therefore generate identical buffer names regardless of node ids.
+	 *
+	 * @param {Node} node - The buffer node.
+	 * @return {number} The index.
+	 */
+	getBufferIndex( node ) {
+
+		let index = this.bufferIndices.get( node );
+
+		if ( index === undefined ) {
+
+			index = this.bufferIndices.size;
+
+			this.bufferIndices.set( node, index );
+
+		}
+
+		return index;
 
 	}
 
@@ -67925,7 +67956,7 @@ ${ flowData.code }
 				const bufferCount = bufferNode.bufferCount;
 
 				const bufferCountSnippet = bufferCount > 0 ? bufferCount : '';
-				snippet = `${bufferNode.name} {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
+				snippet = `${ uniform.blockName } {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
 
 			} else {
 
@@ -68779,7 +68810,10 @@ void main() {
 
 			} else if ( type === 'buffer' ) {
 
-				uniformNode.name = `buffer${ node.id }`;
+				const bufferIndex = this.getBufferIndex( node );
+
+				uniformNode.name = `buffer${ bufferIndex }`;
+				uniformNode.blockName = `NodeBuffer_${ bufferIndex }`;
 
 				const sharedData = this.getSharedDataFromNode( node );
 
@@ -68787,10 +68821,8 @@ void main() {
 
 				if ( buffer === undefined ) {
 
-					node.name = `NodeBuffer_${ node.id }`;
-
 					buffer = new NodeUniformBuffer( node, group );
-					buffer.name = node.name;
+					buffer.name = uniformNode.blockName;
 
 					sharedData.buffer = buffer;
 
@@ -82801,7 +82833,7 @@ class WGSLNodeBuilder extends NodeBuilder {
 
 				uniformGPU = buffer;
 
-				uniformNode.name = name ? name : 'NodeBuffer_' + uniformNode.id;
+				uniformNode.name = name ? name : 'NodeBuffer_' + this.getBufferIndex( node );
 
 			} else {
 

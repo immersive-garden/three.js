@@ -935,7 +935,7 @@ ${ flowData.code }
 				const bufferCount = bufferNode.bufferCount;
 
 				const bufferCountSnippet = bufferCount > 0 ? bufferCount : '';
-				snippet = `${bufferNode.name} {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
+				snippet = `${ uniform.blockName } {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
 
 			} else {
 
@@ -1789,7 +1789,10 @@ void main() {
 
 			} else if ( type === 'buffer' ) {
 
-				uniformNode.name = `buffer${ node.id }`;
+				const bufferIndex = this.getBufferIndex( node );
+
+				uniformNode.name = `buffer${ bufferIndex }`;
+				uniformNode.blockName = `NodeBuffer_${ bufferIndex }`;
 
 				const sharedData = this.getSharedDataFromNode( node );
 
@@ -1797,10 +1800,8 @@ void main() {
 
 				if ( buffer === undefined ) {
 
-					node.name = `NodeBuffer_${ node.id }`;
-
 					buffer = new NodeUniformBuffer( node, group );
-					buffer.name = node.name;
+					buffer.name = uniformNode.blockName;
 
 					sharedData.buffer = buffer;
 

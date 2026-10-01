@@ -459,6 +459,14 @@ class NodeBuilder {
 		this.flowsData = new WeakMap();
 
 		/**
+		 * Per-builder indices of buffer nodes, used to name buffer bindings
+		 * independently of global node ids.
+		 *
+		 * @type {Map<Node,number>}
+		 */
+		this.bufferIndices = new Map();
+
+		/**
 		 * The current shader stage.
 		 *
 		 * @type {?('vertex'|'fragment'|'compute'|'any')}
@@ -3294,6 +3302,29 @@ class NodeBuilder {
 		this.buildUpdateNodes();
 
 		return this;
+
+	}
+
+	/**
+	 * Returns a deterministic per-builder index for the given buffer node, assigned on first
+	 * request. Identical graphs therefore generate identical buffer names regardless of node ids.
+	 *
+	 * @param {Node} node - The buffer node.
+	 * @return {number} The index.
+	 */
+	getBufferIndex( node ) {
+
+		let index = this.bufferIndices.get( node );
+
+		if ( index === undefined ) {
+
+			index = this.bufferIndices.size;
+
+			this.bufferIndices.set( node, index );
+
+		}
+
+		return index;
 
 	}
 
