@@ -62717,7 +62717,18 @@ class Renderer {
 		// Yields between objects to keep animation smooth
 
 		const total = compilationPromises.length;
-		let loaded = 0;
+		const pipelinePromises = [];
+		const compiledObjects = [];
+
+		const report = ( loaded ) => {
+
+			if ( onProgress !== null ) {
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		for ( const item of compilationPromises ) {
 
@@ -62735,31 +62746,43 @@ class Renderer {
 			this._bindings.updateForRender( renderObject );
 			this._isPreCompiling = false;
 
-			// Wait for pipeline creation
-			const pipelinePromises = [];
+			// Pipelines are requested here but awaited together after the loop
 			this._pipelines.getForRender( renderObject, pipelinePromises );
-			if ( pipelinePromises.length > 0 ) {
 
-				await Promise.all( pipelinePromises );
+			compiledObjects.push( renderObject );
 
-			}
-
-			this._isPreCompiling = true;
-			this._nodes.updateAfter( renderObject );
-			this._isPreCompiling = false;
-
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
+			// Node building covers the first half of the progress
+			report( compiledObjects.length * 0.5 );
 
 			// Yield between objects to allow animation frames
 			await yieldToMain();
 
 		}
+
+		if ( pipelinePromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( total * 0.5 + total * 0.5 * ( settled / pipelinePromises.length ) );
+
+			};
+
+			await Promise.all( pipelinePromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const renderObject of compiledObjects ) {
+
+			this._isPreCompiling = true;
+			this._nodes.updateAfter( renderObject );
+			this._isPreCompiling = false;
+
+		}
+
+		report( total );
 
 	}
 
@@ -62788,13 +62811,25 @@ class Renderer {
 		}
 
 		const total = computeList.length;
-		let loaded = 0;
+
+		const report = ( loaded ) => {
+
+			if ( onProgress !== null ) {
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		//
 
 		const pipelines = this._pipelines;
 		const bindings = this._bindings;
 		const nodes = this._nodes;
+
+		const compilationPromises = [];
+		let built = 0;
 
 		for ( const computeNode of computeList ) {
 
@@ -62829,24 +62864,39 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const compilationPromises = [];
 
 			pipelines.getForCompute( computeNode, computeBindings, compilationPromises );
-			await Promise.all( compilationPromises );
+
+			built ++;
+
+			report( built * 0.5 );
+
+			if ( built < total ) await yieldToMain();
+
+		}
+
+		if ( compilationPromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( total * 0.5 + total * 0.5 * ( settled / compilationPromises.length ) );
+
+			};
+
+			await Promise.all( compilationPromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const computeNode of computeList ) {
 
 			nodes.updateAfterForCompute( computeNode );
 
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
-
-			if ( loaded < total ) await yieldToMain();
-
 		}
+
+		report( total );
 
 	}
 
