@@ -77686,11 +77686,46 @@ const _queues = new WeakMap();
 
 const _wrappedMethods = [ 'submit', 'onSubmittedWorkDone', 'writeBuffer', 'writeTexture', 'copyExternalImageToTexture', 'copyElementImageToTexture' ];
 
+const _stagingMinSize = 262144;
+const _stagingMaxSize = 4194304;
+
+const _stagingDescriptor = { label: 'WebGPUCommandQueue.staging', size: 0, usage: 0 };
+const _uploadEncoderDescriptor = { label: 'WebGPUCommandQueue.writes' };
+
+/**
+ * Returns the byte length a `writeBuffer()` call would write, or `-1` if the
+ * arguments are not a valid in-range write.
+ *
+ * @private
+ * @param {BufferSource} data - The source data.
+ * @param {number} [dataOffset=0] - Offset into `data`, in elements for typed arrays and in bytes otherwise.
+ * @param {number} [size] - Size of the write, in the same units as `dataOffset`.
+ * @return {number} The byte length.
+ */
+function getWriteByteLength( data, dataOffset = 0, size = undefined ) {
+
+	if ( data === null || typeof data !== 'object' ) return -1;
+
+	const elementSize = data.BYTES_PER_ELEMENT !== undefined ? data.BYTES_PER_ELEMENT : 1;
+	const length = data.BYTES_PER_ELEMENT !== undefined ? data.length : data.byteLength;
+	const count = size === undefined ? length - dataOffset : size;
+
+	if ( Number.isInteger( length ) === false || Number.isInteger( dataOffset ) === false || Number.isInteger( count ) === false ) return -1;
+	if ( dataOffset < 0 || count < 0 || dataOffset + count > length ) return -1;
+
+	return count * elementSize;
+
+}
+
 /**
  * Defers command buffer submission so a frame reaches the GPU in as few
  * `queue.submit()` calls as possible. Pending command buffers are flushed at
- * the end of the frame, before a queue write would overwrite a resource that a
- * pending command buffer may still read, and before any readback.
+ * the end of the frame and before any readback.
+ *
+ * A queue write executes before every command buffer submitted after it, so a
+ * buffer write made while command buffers are pending is staged instead and
+ * copied by a command buffer appended at that point, keeping the order of
+ * immediate submission. Texture writes flush first.
  *
  * @private
  */
@@ -77735,19 +77770,26 @@ class WebGPUCommandQueue {
 		this.pending = [];
 
 		/**
-		 * The number of command buffers appended so far. Used to stamp writes.
+		 * Records the copies of staged buffer writes made since the last pending
+		 * command buffer. It is finished and appended before the next one.
+		 *
+		 * @type {?GPUCommandEncoder}
+		 */
+		this.uploadEncoder = null;
+
+		/**
+		 * Holds the data of staged buffer writes until the next flush.
+		 *
+		 * @type {?GPUBuffer}
+		 */
+		this.staging = null;
+
+		/**
+		 * Bytes of `staging` used since the last flush.
 		 *
 		 * @type {number}
 		 */
-		this.appended = 0;
-
-		/**
-		 * Maps each resource written during the current frame to the value of
-		 * `appended` at its last write.
-		 *
-		 * @type {Map<GPUBuffer|GPUTexture,number>}
-		 */
-		this.writes = new Map();
+		this.stagingOffset = 0;
 
 		/**
 		 * Resources whose destruction waits for the next flush.
@@ -77853,33 +77895,94 @@ class WebGPUCommandQueue {
 
 		if ( this.isLost === true ) return;
 
+		this._closeUploads();
+
 		this.pending.push( commandBuffer );
-		this.appended ++;
 
 		this._queueFlush();
 
 	}
 
 	/**
-	 * Records a queue write to the given resource. If the resource was already
-	 * written this frame and a command buffer appended since then is still
-	 * pending, the pending list is flushed first.
+	 * Stages a buffer write while command buffers are pending, so it executes
+	 * after them and before command buffers appended later. Returns `false` when
+	 * the caller must write directly, after flushing if ordering requires it.
 	 *
-	 * @param {GPUBuffer|GPUTexture} resource - The written resource.
+	 * @param {GPUBuffer} buffer - The destination buffer.
+	 * @param {number} bufferOffset - The byte offset into `buffer`.
+	 * @param {BufferSource} data - The source data.
+	 * @param {number} [dataOffset] - Offset into `data`, in elements for typed arrays and in bytes otherwise.
+	 * @param {number} [size] - Size of the write, in the same units as `dataOffset`.
+	 * @return {boolean} Whether the write was staged.
 	 */
-	write( resource ) {
+	stageWrite( buffer, bufferOffset, data, dataOffset, size ) {
 
-		const stamp = this.writes.get( resource );
+		if ( this.pending.length === 0 || this.isLost === true ) return false;
 
-		if ( stamp !== undefined && stamp < this.appended && this.pending.length > 0 ) {
+		const byteLength = getWriteByteLength( data, dataOffset, size );
+
+		if ( byteLength === 0 ) return false;
+
+		if ( byteLength < 0 || byteLength > _stagingMaxSize || Number.isInteger( bufferOffset ) === false || bufferOffset < 0 || ( bufferOffset % 4 ) !== 0 || ( byteLength % 4 ) !== 0 ||
+			bufferOffset + byteLength > buffer.size || ( buffer.usage & GPUBufferUsage.COPY_DST ) === 0 || buffer.mapState !== 'unmapped' ) {
 
 			this.flush();
 
+			return false;
+
 		}
 
-		this.writes.set( resource, this.appended );
+		let staging = this.staging;
+
+		if ( staging === null || this.stagingOffset + byteLength > staging.size ) {
+
+			if ( staging !== null && staging.size >= _stagingMaxSize ) {
+
+				this.flush();
+
+				return false;
+
+			}
+
+			let stagingSize = staging === null ? _stagingMinSize : staging.size * 2;
+
+			while ( stagingSize < byteLength ) stagingSize *= 2;
+
+			if ( staging !== null ) this.destroyQueue.push( staging );
+
+			_stagingDescriptor.size = Math.min( stagingSize, _stagingMaxSize );
+			_stagingDescriptor.usage = GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+
+			staging = this.device.createBuffer( _stagingDescriptor );
+
+			this.staging = staging;
+			this.stagingOffset = 0;
+
+		}
+
+		const offset = this.stagingOffset;
+
+		Object.getPrototypeOf( this.queue ).writeBuffer.call( this.queue, staging, offset, data, dataOffset, size );
+
+		if ( this.uploadEncoder === null ) this.uploadEncoder = this.device.createCommandEncoder( _uploadEncoderDescriptor );
+
+		this.uploadEncoder.copyBufferToBuffer( staging, offset, buffer, bufferOffset, byteLength );
+
+		this.stagingOffset = offset + byteLength;
 
 		this._queueFlush();
+
+		return true;
+
+	}
+
+	/**
+	 * Flushes pending command buffers before a queue write to a texture, which
+	 * would otherwise execute ahead of them.
+	 */
+	writeTexture() {
+
+		if ( this.pending.length > 0 ) this.flush();
 
 	}
 
@@ -77906,9 +78009,11 @@ class WebGPUCommandQueue {
 	/**
 	 * Submits all pending command buffers in one `queue.submit()` call.
 	 *
-	 * @param {boolean} [frameEnd=false] - Whether this flush ends the frame, which resets write tracking.
+	 * @param {boolean} [frameEnd=false] - Whether this flush ends the frame, which counts down the per-command-buffer fallback.
 	 */
 	flush( frameEnd = false ) {
+
+		this._closeUploads();
 
 		const pending = this.pending;
 
@@ -77949,6 +78054,7 @@ class WebGPUCommandQueue {
 		}
 
 		pending.length = 0;
+		this.stagingOffset = 0;
 
 		const destroyQueue = this.destroyQueue;
 
@@ -77960,8 +78066,6 @@ class WebGPUCommandQueue {
 
 		}
 
-		if ( frameEnd === true ) this.writes.clear();
-
 	}
 
 	/**
@@ -77971,11 +78075,19 @@ class WebGPUCommandQueue {
 
 		this.isLost = true;
 		this.pending.length = 0;
-		this.writes.clear();
+		this.uploadEncoder = null;
+		this.stagingOffset = 0;
 
 		for ( const resource of this.destroyQueue ) resource.destroy();
 
 		this.destroyQueue.length = 0;
+
+		if ( this.staging !== null ) {
+
+			this.staging.destroy();
+			this.staging = null;
+
+		}
 
 	}
 
@@ -77986,6 +78098,13 @@ class WebGPUCommandQueue {
 
 		this.flush( true );
 
+		if ( this.staging !== null ) {
+
+			this.staging.destroy();
+			this.staging = null;
+
+		}
+
 		const queue = this.queue;
 
 		for ( const name of _wrappedMethods ) {
@@ -77995,6 +78114,25 @@ class WebGPUCommandQueue {
 		}
 
 		_queues.delete( this.device );
+
+	}
+
+	/**
+	 * Appends the command buffer holding the copies of staged writes, if any.
+	 *
+	 * @private
+	 */
+	_closeUploads() {
+
+		if ( this.uploadEncoder !== null ) {
+
+			const uploadEncoder = this.uploadEncoder;
+
+			this.uploadEncoder = null;
+
+			if ( this.isLost === false ) this.pending.push( uploadEncoder.finish() );
+
+		}
 
 	}
 
@@ -78044,25 +78182,25 @@ class WebGPUCommandQueue {
 
 		};
 
-		queue.writeBuffer = function ( buffer ) {
+		queue.writeBuffer = function ( buffer, bufferOffset, data, dataOffset, size ) {
 
-			scope.write( buffer );
+			if ( scope.stageWrite( buffer, bufferOffset, data, dataOffset, size ) === true ) return;
 
 			return proto.writeBuffer.apply( queue, arguments );
 
 		};
 
-		queue.writeTexture = function ( destination ) {
+		queue.writeTexture = function () {
 
-			scope.write( destination.texture );
+			scope.writeTexture();
 
 			return proto.writeTexture.apply( queue, arguments );
 
 		};
 
-		queue.copyExternalImageToTexture = function ( source, destination ) {
+		queue.copyExternalImageToTexture = function () {
 
-			scope.write( destination.texture );
+			scope.writeTexture();
 
 			return proto.copyExternalImageToTexture.apply( queue, arguments );
 
@@ -78072,9 +78210,7 @@ class WebGPUCommandQueue {
 
 			const copyElementImageToTexture = function () {
 
-				const destination = arguments.length === 2 ? arguments[ 1 ].destination : arguments[ 3 ];
-
-				if ( destination && destination.texture ) scope.write( destination.texture );
+				scope.writeTexture();
 
 				return proto.copyElementImageToTexture.apply( queue, arguments );
 
