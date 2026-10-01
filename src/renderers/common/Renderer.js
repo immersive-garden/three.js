@@ -1065,13 +1065,19 @@ class Renderer {
 		// Process compilation work items sequentially to avoid freezing
 		// Yields between objects to keep animation smooth
 
-		const total = compilationPromises.length;
+		const count = compilationPromises.length;
 		const pipelinePromises = [];
 		const compiledObjects = [];
 
+		// Two integer steps per object: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = - 1;
+
 		const report = ( loaded ) => {
 
-			if ( onProgress !== null ) {
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
 
 				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
 
@@ -1101,7 +1107,7 @@ class Renderer {
 			compiledObjects.push( renderObject );
 
 			// Node building covers the first half of the progress
-			report( compiledObjects.length * 0.5 );
+			report( compiledObjects.length );
 
 			// Yield between objects to allow animation frames
 			await yieldToMain();
@@ -1115,7 +1121,7 @@ class Renderer {
 			const onSettled = () => {
 
 				settled ++;
-				report( total * 0.5 + total * 0.5 * ( settled / pipelinePromises.length ) );
+				report( count + Math.floor( count * settled / pipelinePromises.length ) );
 
 			};
 
@@ -1159,11 +1165,17 @@ class Renderer {
 
 		}
 
-		const total = computeList.length;
+		const count = computeList.length;
+
+		// Two integer steps per node: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = - 1;
 
 		const report = ( loaded ) => {
 
-			if ( onProgress !== null ) {
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
 
 				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
 
@@ -1218,9 +1230,9 @@ class Renderer {
 
 			built ++;
 
-			report( built * 0.5 );
+			report( built );
 
-			if ( built < total ) await yieldToMain();
+			if ( built < count ) await yieldToMain();
 
 		}
 
@@ -1231,7 +1243,7 @@ class Renderer {
 			const onSettled = () => {
 
 				settled ++;
-				report( total * 0.5 + total * 0.5 * ( settled / compilationPromises.length ) );
+				report( count + Math.floor( count * settled / compilationPromises.length ) );
 
 			};
 

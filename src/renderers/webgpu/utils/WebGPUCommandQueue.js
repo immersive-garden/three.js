@@ -17,7 +17,7 @@ class WebGPUCommandQueue {
 	 * device's `GPUQueue` so writes and external submits are ordered correctly.
 	 *
 	 * @param {GPUDevice} device - The GPU device.
-	 * @param {?Function} [onError=null] - Receives validation errors raised by deferred submits.
+	 * @param {?Function} [onError=null] - Receives validation errors raised by deferred submits, plus an optional explanatory message.
 	 */
 	constructor( device, onError = null ) {
 
@@ -36,7 +36,8 @@ class WebGPUCommandQueue {
 		this.queue = device.queue;
 
 		/**
-		 * Receives validation errors raised by deferred submits.
+		 * Receives validation errors raised by deferred submits, plus an optional
+		 * explanatory message.
 		 *
 		 * @type {?Function}
 		 */
@@ -78,7 +79,27 @@ class WebGPUCommandQueue {
 		 */
 		this.isLost = false;
 
+		/**
+		 * Remaining frame-end flushes with work that submit each command buffer on its own.
+		 * Set after a batched submit fails, since one invalid command buffer makes
+		 * `queue.submit()` reject the whole batch.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackFlushes = 0;
+
+		/**
+		 * Length of the next per-command-buffer fallback window, in frame-end flushes. Doubles
+		 * each time batching is retried and fails again.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackLength = 120;
+
 		this._flushQueued = false;
+		this._fallbackLogged = false;
+		this._fallbackWindow = 0;
+		this._single = [ null ];
 
 		this._frameFlush = () => {
 
@@ -89,7 +110,35 @@ class WebGPUCommandQueue {
 
 		this._onSubmitError = ( err ) => {
 
-			if ( err !== null && this.onError !== null ) this.onError( err );
+			if ( err === null ) return;
+
+			if ( this.fallbackFlushes > 0 ) this.fallbackFlushes = this._fallbackWindow;
+
+			if ( this.onError !== null ) this.onError( err );
+
+		};
+
+		this._onBatchSubmitError = ( err ) => {
+
+			if ( err === null || this.fallbackFlushes > 0 ) return;
+
+			this._fallbackWindow = this.fallbackLength;
+			this.fallbackFlushes = this._fallbackWindow;
+			this.fallbackLength = Math.min( this.fallbackLength * 2, 7680 );
+
+			if ( this.onError === null ) return;
+
+			if ( this._fallbackLogged === false ) {
+
+				this._fallbackLogged = true;
+
+				this.onError( err, `${ err.message } (A batched queue.submit() was rejected because one of its command buffers is invalid, so all work in that batch was lost. Command buffers are now submitted individually for ${ this.fallbackFlushes } frames before batching is retried.)` );
+
+			} else {
+
+				this.onError( err );
+
+			}
 
 		};
 
@@ -184,11 +233,34 @@ class WebGPUCommandQueue {
 			const queue = this.queue;
 			const device = this.device;
 
+			const submitGPU = Object.getPrototypeOf( queue ).submit;
+
 			device.pushErrorScope( 'validation' );
 
-			Object.getPrototypeOf( queue ).submit.call( queue, pending );
+			if ( this.fallbackFlushes > 0 || pending.length === 1 ) {
 
-			device.popErrorScope().then( this._onSubmitError );
+				const single = this._single;
+
+				for ( let i = 0; i < pending.length; i ++ ) {
+
+					single[ 0 ] = pending[ i ];
+					submitGPU.call( queue, single );
+
+				}
+
+				single[ 0 ] = null;
+
+				device.popErrorScope().then( this._onSubmitError );
+
+				if ( frameEnd === true && this.fallbackFlushes > 0 ) this.fallbackFlushes --;
+
+			} else {
+
+				submitGPU.call( queue, pending );
+
+				device.popErrorScope().then( this._onBatchSubmitError );
+
+			}
 
 		}
 

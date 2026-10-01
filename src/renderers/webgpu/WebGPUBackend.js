@@ -275,12 +275,12 @@ class WebGPUBackend extends Backend {
 
 		this._commandQueue = WebGPUCommandQueue.get( device ) || new WebGPUCommandQueue( device );
 
-		this._commandQueue.onError = ( gpuError ) => {
+		this._commandQueue.onError = ( gpuError, message = null ) => {
 
 			renderer.onError( {
 				api: 'WebGPU',
 				type: gpuError.constructor ? gpuError.constructor.name : 'GPUError',
-				message: gpuError.message || 'Unknown GPU error in deferred submit',
+				message: message || gpuError.message || 'Unknown GPU error in deferred submit',
 				originalEvent: null
 			} );
 
@@ -1926,7 +1926,12 @@ class WebGPUBackend extends Backend {
 
 		// pipeline
 
-		const pipelineGPU = this.get( pipeline ).pipeline;
+		const pipelineData = this.get( pipeline );
+
+		// Skip if pipeline has error, so one broken kernel does not invalidate the batch
+		if ( pipelineData.error === true ) return;
+
+		const pipelineGPU = pipelineData.pipeline;
 
 		if ( groupGPU.currentPipeline !== pipelineGPU ) {
 
@@ -3292,6 +3297,9 @@ class WebGPUBackend extends Backend {
 
 	async dispose() {
 
+		// Submit deferred command buffers before their query sets and buffers are destroyed.
+		if ( this._commandQueue !== null ) this._commandQueue.flush( true );
+
 		await super.dispose();
 
 		this.bindingUtils.dispose();
@@ -3301,7 +3309,7 @@ class WebGPUBackend extends Backend {
 
 			for ( const buffer of this.occludedResolveCache.values() ) {
 
-				buffer.destroy();
+				destroyResource( this.device, buffer );
 
 			}
 

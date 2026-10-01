@@ -62839,13 +62839,19 @@ class Renderer {
 		// Process compilation work items sequentially to avoid freezing
 		// Yields between objects to keep animation smooth
 
-		const total = compilationPromises.length;
+		const count = compilationPromises.length;
 		const pipelinePromises = [];
 		const compiledObjects = [];
 
+		// Two integer steps per object: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = -1;
+
 		const report = ( loaded ) => {
 
-			if ( onProgress !== null ) {
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
 
 				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
 
@@ -62875,7 +62881,7 @@ class Renderer {
 			compiledObjects.push( renderObject );
 
 			// Node building covers the first half of the progress
-			report( compiledObjects.length * 0.5 );
+			report( compiledObjects.length );
 
 			// Yield between objects to allow animation frames
 			await yieldToMain();
@@ -62889,7 +62895,7 @@ class Renderer {
 			const onSettled = () => {
 
 				settled ++;
-				report( total * 0.5 + total * 0.5 * ( settled / pipelinePromises.length ) );
+				report( count + Math.floor( count * settled / pipelinePromises.length ) );
 
 			};
 
@@ -62933,11 +62939,17 @@ class Renderer {
 
 		}
 
-		const total = computeList.length;
+		const count = computeList.length;
+
+		// Two integer steps per node: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = -1;
 
 		const report = ( loaded ) => {
 
-			if ( onProgress !== null ) {
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
 
 				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
 
@@ -62992,9 +63004,9 @@ class Renderer {
 
 			built ++;
 
-			report( built * 0.5 );
+			report( built );
 
-			if ( built < total ) await yieldToMain();
+			if ( built < count ) await yieldToMain();
 
 		}
 
@@ -63005,7 +63017,7 @@ class Renderer {
 			const onSettled = () => {
 
 				settled ++;
-				report( total * 0.5 + total * 0.5 * ( settled / compilationPromises.length ) );
+				report( count + Math.floor( count * settled / compilationPromises.length ) );
 
 			};
 
@@ -77665,7 +77677,7 @@ class WebGPUCommandQueue {
 	 * device's `GPUQueue` so writes and external submits are ordered correctly.
 	 *
 	 * @param {GPUDevice} device - The GPU device.
-	 * @param {?Function} [onError=null] - Receives validation errors raised by deferred submits.
+	 * @param {?Function} [onError=null] - Receives validation errors raised by deferred submits, plus an optional explanatory message.
 	 */
 	constructor( device, onError = null ) {
 
@@ -77684,7 +77696,8 @@ class WebGPUCommandQueue {
 		this.queue = device.queue;
 
 		/**
-		 * Receives validation errors raised by deferred submits.
+		 * Receives validation errors raised by deferred submits, plus an optional
+		 * explanatory message.
 		 *
 		 * @type {?Function}
 		 */
@@ -77726,7 +77739,27 @@ class WebGPUCommandQueue {
 		 */
 		this.isLost = false;
 
+		/**
+		 * Remaining frame-end flushes with work that submit each command buffer on its own.
+		 * Set after a batched submit fails, since one invalid command buffer makes
+		 * `queue.submit()` reject the whole batch.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackFlushes = 0;
+
+		/**
+		 * Length of the next per-command-buffer fallback window, in frame-end flushes. Doubles
+		 * each time batching is retried and fails again.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackLength = 120;
+
 		this._flushQueued = false;
+		this._fallbackLogged = false;
+		this._fallbackWindow = 0;
+		this._single = [ null ];
 
 		this._frameFlush = () => {
 
@@ -77737,7 +77770,35 @@ class WebGPUCommandQueue {
 
 		this._onSubmitError = ( err ) => {
 
-			if ( err !== null && this.onError !== null ) this.onError( err );
+			if ( err === null ) return;
+
+			if ( this.fallbackFlushes > 0 ) this.fallbackFlushes = this._fallbackWindow;
+
+			if ( this.onError !== null ) this.onError( err );
+
+		};
+
+		this._onBatchSubmitError = ( err ) => {
+
+			if ( err === null || this.fallbackFlushes > 0 ) return;
+
+			this._fallbackWindow = this.fallbackLength;
+			this.fallbackFlushes = this._fallbackWindow;
+			this.fallbackLength = Math.min( this.fallbackLength * 2, 7680 );
+
+			if ( this.onError === null ) return;
+
+			if ( this._fallbackLogged === false ) {
+
+				this._fallbackLogged = true;
+
+				this.onError( err, `${ err.message } (A batched queue.submit() was rejected because one of its command buffers is invalid, so all work in that batch was lost. Command buffers are now submitted individually for ${ this.fallbackFlushes } frames before batching is retried.)` );
+
+			} else {
+
+				this.onError( err );
+
+			}
 
 		};
 
@@ -77832,11 +77893,34 @@ class WebGPUCommandQueue {
 			const queue = this.queue;
 			const device = this.device;
 
+			const submitGPU = Object.getPrototypeOf( queue ).submit;
+
 			device.pushErrorScope( 'validation' );
 
-			Object.getPrototypeOf( queue ).submit.call( queue, pending );
+			if ( this.fallbackFlushes > 0 || pending.length === 1 ) {
 
-			device.popErrorScope().then( this._onSubmitError );
+				const single = this._single;
+
+				for ( let i = 0; i < pending.length; i ++ ) {
+
+					single[ 0 ] = pending[ i ];
+					submitGPU.call( queue, single );
+
+				}
+
+				single[ 0 ] = null;
+
+				device.popErrorScope().then( this._onSubmitError );
+
+				if ( frameEnd === true && this.fallbackFlushes > 0 ) this.fallbackFlushes --;
+
+			} else {
+
+				submitGPU.call( queue, pending );
+
+				device.popErrorScope().then( this._onBatchSubmitError );
+
+			}
 
 		}
 
@@ -86335,6 +86419,10 @@ class WebGPUPipelineUtils {
 
 					_renderPipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -86349,7 +86437,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -86492,6 +86580,10 @@ class WebGPUPipelineUtils {
 
 					_computePipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -86506,7 +86598,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -87844,12 +87936,12 @@ class WebGPUBackend extends Backend {
 
 		this._commandQueue = WebGPUCommandQueue.get( device ) || new WebGPUCommandQueue( device );
 
-		this._commandQueue.onError = ( gpuError ) => {
+		this._commandQueue.onError = ( gpuError, message = null ) => {
 
 			renderer.onError( {
 				api: 'WebGPU',
 				type: gpuError.constructor ? gpuError.constructor.name : 'GPUError',
-				message: gpuError.message || 'Unknown GPU error in deferred submit',
+				message: message || gpuError.message || 'Unknown GPU error in deferred submit',
 				originalEvent: null
 			} );
 
@@ -89495,7 +89587,12 @@ class WebGPUBackend extends Backend {
 
 		// pipeline
 
-		const pipelineGPU = this.get( pipeline ).pipeline;
+		const pipelineData = this.get( pipeline );
+
+		// Skip if pipeline has error, so one broken kernel does not invalidate the batch
+		if ( pipelineData.error === true ) return;
+
+		const pipelineGPU = pipelineData.pipeline;
 
 		if ( groupGPU.currentPipeline !== pipelineGPU ) {
 
@@ -90861,6 +90958,9 @@ class WebGPUBackend extends Backend {
 
 	async dispose() {
 
+		// Submit deferred command buffers before their query sets and buffers are destroyed.
+		if ( this._commandQueue !== null ) this._commandQueue.flush( true );
+
 		await super.dispose();
 
 		this.bindingUtils.dispose();
@@ -90870,7 +90970,7 @@ class WebGPUBackend extends Backend {
 
 			for ( const buffer of this.occludedResolveCache.values() ) {
 
-				buffer.destroy();
+				destroyResource( this.device, buffer );
 
 			}
 
