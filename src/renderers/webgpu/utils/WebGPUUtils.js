@@ -1,5 +1,6 @@
 import { HalfFloatType, UnsignedByteType } from '../../../constants.js';
 import { GPUPrimitiveTopology, GPUTextureFormat } from './WebGPUConstants.js';
+import WebGPUCommandQueue from './WebGPUCommandQueue.js';
 
 const _commandList = [ null ];
 
@@ -296,8 +297,8 @@ class WebGPUUtils {
 }
 
 /**
- * Submits a single GPU command to the device queue using a shared, module-scoped
- * array to avoid per-call array allocations.
+ * Submits a single GPU command. If the device has a command queue, the command
+ * is deferred until the queue flushes; otherwise it is submitted immediately.
  *
  * @private
  * @param {GPUDevice} device - The GPU device.
@@ -305,11 +306,59 @@ class WebGPUUtils {
  */
 export function submit( device, command ) {
 
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) {
+
+		commandQueue.submit( command );
+		return;
+
+	}
+
 	_commandList[ 0 ] = command;
 
 	device.queue.submit( _commandList );
 
 	_commandList[ 0 ] = null;
+
+}
+
+/**
+ * Submits all deferred commands of the given device. Must be called before
+ * mapping a buffer that pending commands write to.
+ *
+ * @private
+ * @param {GPUDevice} device - The GPU device.
+ */
+export function flush( device ) {
+
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) commandQueue.flush();
+
+}
+
+/**
+ * Destroys a GPU resource, after the next flush if deferred commands may
+ * still reference it.
+ *
+ * @private
+ * @param {GPUDevice} device - The GPU device.
+ * @param {GPUBuffer|GPUTexture|GPUQuerySet} resource - The resource to destroy.
+ */
+export function destroyResource( device, resource ) {
+
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) {
+
+		commandQueue.destroy( resource );
+
+	} else {
+
+		resource.destroy();
+
+	}
 
 }
 

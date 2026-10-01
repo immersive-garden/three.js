@@ -662,6 +662,16 @@ class Renderer {
 		this._compilationPromises = null;
 
 		/**
+		 * While not `null`, pipelines requested by `render()` and `compute()` are created
+		 * asynchronously and their promises are collected here. See `beginPipelineCollection()`.
+		 *
+		 * @private
+		 * @type {?Array<Promise>}
+		 * @default null
+		 */
+		this._pipelineCollection = null;
+
+		/**
 		 * Whether the renderer is currently precompiling a render object in
 		 * `compileAsync()`.
 		 *
@@ -1055,8 +1065,25 @@ class Renderer {
 		// Process compilation work items sequentially to avoid freezing
 		// Yields between objects to keep animation smooth
 
-		const total = compilationPromises.length;
-		let loaded = 0;
+		const count = compilationPromises.length;
+		const pipelinePromises = [];
+		const compiledObjects = [];
+
+		// Two integer steps per object: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = - 1;
+
+		const report = ( loaded ) => {
+
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		for ( const item of compilationPromises ) {
 
@@ -1074,31 +1101,43 @@ class Renderer {
 			this._bindings.updateForRender( renderObject );
 			this._isPreCompiling = false;
 
-			// Wait for pipeline creation
-			const pipelinePromises = [];
+			// Pipelines are requested here but awaited together after the loop
 			this._pipelines.getForRender( renderObject, pipelinePromises );
-			if ( pipelinePromises.length > 0 ) {
 
-				await Promise.all( pipelinePromises );
+			compiledObjects.push( renderObject );
 
-			}
-
-			this._isPreCompiling = true;
-			this._nodes.updateAfter( renderObject );
-			this._isPreCompiling = false;
-
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
+			// Node building covers the first half of the progress
+			report( compiledObjects.length );
 
 			// Yield between objects to allow animation frames
 			await yieldToMain();
 
 		}
+
+		if ( pipelinePromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( count + Math.floor( count * settled / pipelinePromises.length ) );
+
+			};
+
+			await Promise.all( pipelinePromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const renderObject of compiledObjects ) {
+
+			this._isPreCompiling = true;
+			this._nodes.updateAfter( renderObject );
+			this._isPreCompiling = false;
+
+		}
+
+		report( total );
 
 	}
 
@@ -1126,14 +1165,32 @@ class Renderer {
 
 		}
 
-		const total = computeList.length;
-		let loaded = 0;
+		const count = computeList.length;
+
+		// Two integer steps per node: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = - 1;
+
+		const report = ( loaded ) => {
+
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		//
 
 		const pipelines = this._pipelines;
 		const bindings = this._bindings;
 		const nodes = this._nodes;
+
+		const compilationPromises = [];
+		let built = 0;
 
 		for ( const computeNode of computeList ) {
 
@@ -1168,24 +1225,39 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const compilationPromises = [];
 
 			pipelines.getForCompute( computeNode, computeBindings, compilationPromises );
-			await Promise.all( compilationPromises );
+
+			built ++;
+
+			report( built );
+
+			if ( built < count ) await yieldToMain();
+
+		}
+
+		if ( compilationPromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( count + Math.floor( count * settled / compilationPromises.length ) );
+
+			};
+
+			await Promise.all( compilationPromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const computeNode of computeList ) {
 
 			nodes.updateAfterForCompute( computeNode );
 
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
-
-			if ( loaded < total ) await yieldToMain();
-
 		}
+
+		report( total );
 
 	}
 
@@ -2690,6 +2762,17 @@ class Renderer {
 	}
 
 	/**
+	 * Submits GPU work the backend has deferred. The WebGPU backend batches the
+	 * command buffers of a frame and submits them at the end of the task, so call
+	 * this to submit earlier, e.g. before timing GPU work.
+	 */
+	flush() {
+
+		if ( this._initialized === true ) this.backend.flush();
+
+	}
+
+	/**
 	 * Frees all internal resources of the renderer. Call this method if the renderer
 	 * is no longer in use by your app.
 	 */
@@ -2958,7 +3041,9 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const computePipeline = pipelines.getForCompute( computeNode, computeBindings );
+			const computePipeline = pipelines.getForCompute( computeNode, computeBindings, this._pipelineCollection );
+
+			if ( pipelines.isReady( computeNode ) === false ) continue;
 
 			backend.compute( computeNodes, computeNode, computeBindings, computePipeline, dispatchSize );
 
@@ -2994,6 +3079,32 @@ class Renderer {
 		if ( this._initialized === false ) await this.init();
 
 		this.compute( computeNodes, dispatchSize );
+
+	}
+
+	/**
+	 * Starts collecting pipeline creations. Until `endPipelineCollection()` is called, every
+	 * pipeline that `render()` or `compute()` needs is created asynchronously, in parallel,
+	 * and draws or dispatches using it are skipped until it is ready.
+	 */
+	beginPipelineCollection() {
+
+		this._pipelineCollection = [];
+
+	}
+
+	/**
+	 * Stops collecting pipeline creations started with `beginPipelineCollection()`.
+	 *
+	 * @return {Array<Promise>} The promises of the pipelines requested while collecting. They resolve also when creation fails.
+	 */
+	endPipelineCollection() {
+
+		const promises = this._pipelineCollection || [];
+
+		this._pipelineCollection = null;
+
+		return promises;
 
 	}
 
@@ -3888,7 +3999,7 @@ class Renderer {
 
 		}
 
-		this._pipelines.updateForRender( renderObject );
+		this._pipelines.updateForRender( renderObject, this._pipelineCollection );
 
 		//
 
@@ -3952,7 +4063,7 @@ class Renderer {
 		this._nodes.updateForRender( renderObject );
 		this._bindings.updateForRender( renderObject );
 
-		this._pipelines.getForRender( renderObject, this._compilationPromises );
+		this._pipelines.getForRender( renderObject, this._pipelineCollection );
 
 		this._nodes.updateAfter( renderObject );
 

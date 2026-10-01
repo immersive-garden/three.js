@@ -298,6 +298,10 @@ class WebGPUPipelineUtils {
 
 					_renderPipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -312,7 +316,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -455,6 +459,10 @@ class WebGPUPipelineUtils {
 
 					_computePipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -469,7 +477,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -486,11 +494,15 @@ class WebGPUPipelineUtils {
 
 					// Guarantee resolution so `compileComputeAsync`'s Promise.all cannot hang on an
 					// unexpected throw from any await above.
+					pipelineGPU.promise = undefined;
+
 					resolve();
 
 				}
 
 			} );
+
+			pipelineGPU.promise = promise;
 
 			promises.push( promise );
 

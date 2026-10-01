@@ -1,6 +1,6 @@
 import DataMap from '../../common/DataMap.js';
 import { GPUFilterMode, GPULoadOp, GPUStoreOp } from './WebGPUConstants.js';
-import { submit } from './WebGPUUtils.js';
+import { submit, destroyResource } from './WebGPUUtils.js';
 import GPUBindGroupDescriptor from '../descriptors/GPUBindGroupDescriptor.js';
 import GPUBufferDescriptor from '../descriptors/GPUBufferDescriptor.js';
 import GPUCommandEncoderDescriptor from '../descriptors/GPUCommandEncoderDescriptor.js';
@@ -304,7 +304,7 @@ fn main_cube( Varys: VarysStruct ) -> @location( 0 ) vec4<f32> {
 
 		submit( this.device, commandEncoder.finish() );
 
-		tempTexture.destroy();
+		destroyResource( this.device, tempTexture );
 
 	}
 

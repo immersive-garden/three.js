@@ -33137,14 +33137,19 @@ class Pipelines extends DataMap {
 
 			// programmable stage
 
-			let stageCompute = this.programs.compute.get( nodeBuilderState.computeShader );
+			// WebGPU stages only carry code and are shared; WebGL stages carry per-node transforms and attributes
+
+			const programKey = backend.isWebGPUBackend === true ? nodeBuilderState.computeShader : computeNode.id + ',' + nodeBuilderState.computeShader;
+
+			let stageCompute = this.programs.compute.get( programKey );
 
 			if ( stageCompute === undefined ) {
 
 				if ( previousPipeline && previousPipeline.computeProgram.usedTimes === 0 ) this._releaseProgram( previousPipeline.computeProgram );
 
 				stageCompute = new ProgrammableStage( nodeBuilderState.computeShader, 'compute', computeNode.name, nodeBuilderState.transforms, nodeBuilderState.nodeAttributes );
-				this.programs.compute.set( nodeBuilderState.computeShader, stageCompute );
+				stageCompute.cacheKey = programKey;
+				this.programs.compute.set( programKey, stageCompute );
 
 				backend.createProgram( stageCompute );
 				this.info.createProgram( stageCompute );
@@ -33153,15 +33158,45 @@ class Pipelines extends DataMap {
 
 			// determine compute pipeline
 
-			const cacheKey = this._getComputeCacheKey( computeNode, stageCompute );
+			let cacheKey = this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 			let pipeline = this.caches.get( cacheKey );
+
+			data.sharedKey = undefined;
+
+			if ( pipeline !== undefined && backend.isWebGPUBackend === true ) {
+
+				const pipelineData = backend.get( pipeline );
+
+				if ( pipelineData.pipeline === undefined ) {
+
+					if ( promises !== null && pipelineData.promise !== undefined ) {
+
+						if ( promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
+
+					} else {
+
+						// a shared pipeline that failed, or is still compiling for a sync caller, can't be dispatched, so build a per-node one
+
+						data.sharedKey = cacheKey;
+						cacheKey = computeNode.id + ',' + stageCompute.id;
+						pipeline = this.caches.get( cacheKey );
+
+					}
+
+				}
+
+			}
 
 			if ( pipeline === undefined ) {
 
 				if ( previousPipeline && previousPipeline.usedTimes === 0 ) this._releasePipeline( previousPipeline );
 
 				pipeline = this._getComputePipeline( computeNode, stageCompute, cacheKey, bindings, promises );
+
+			} else if ( previousPipeline && previousPipeline !== pipeline && previousPipeline.usedTimes === 0 ) {
+
+				this._releasePipeline( previousPipeline );
 
 			}
 
@@ -33277,11 +33312,11 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Checks if the render pipeline for the given render object is ready for drawing.
-	 * Returns false if the GPU pipeline is still being compiled asynchronously.
+	 * Checks if the pipeline for the given render object or compute node is ready for drawing
+	 * or dispatching. Returns false if the GPU pipeline is still being compiled asynchronously.
 	 *
-	 * @param {RenderObject} renderObject - The render object.
-	 * @return {boolean} True if the pipeline is ready for drawing.
+	 * @param {RenderObject|Node} renderObject - The render object or compute node.
+	 * @return {boolean} True if the pipeline is ready.
 	 */
 	isReady( renderObject ) {
 
@@ -33358,10 +33393,11 @@ class Pipelines extends DataMap {
 	 * Updates the pipeline for the given render object.
 	 *
 	 * @param {RenderObject} renderObject - The render object.
+	 * @param {?Array<Promise>} [promises=null] - If set, a new pipeline is created asynchronously and its promise is pushed here.
 	 */
-	updateForRender( renderObject ) {
+	updateForRender( renderObject, promises = null ) {
 
-		this.getForRender( renderObject );
+		this.getForRender( renderObject, promises );
 
 	}
 
@@ -33380,7 +33416,7 @@ class Pipelines extends DataMap {
 
 		// check for existing pipeline
 
-		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute );
+		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 		let pipeline = this.caches.get( cacheKey );
 
@@ -33438,14 +33474,37 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Computes a cache key representing a compute pipeline.
+	 * Computes a cache key representing a compute pipeline. On WebGPU, compute nodes with
+	 * the same shader program and equivalent bind group layouts share one pipeline. The
+	 * WebGL backend stores per-node state on the pipeline, so it keeps one per node.
 	 *
 	 * @private
 	 * @param {Node} computeNode - The compute node.
 	 * @param {ProgrammableStage} stageCompute - The programmable stage representing the compute shader.
+	 * @param {Array<BindGroup>} bindings - The bindings.
 	 * @return {string} The cache key.
 	 */
-	_getComputeCacheKey( computeNode, stageCompute ) {
+	_getComputeCacheKey( computeNode, stageCompute, bindings ) {
+
+		const { backend } = this;
+
+		if ( backend.isWebGPUBackend === true && bindings ) {
+
+			let layoutKey = '';
+
+			for ( const bindGroup of bindings ) {
+
+				const groupLayoutKey = backend.get( bindGroup ).layoutKey;
+
+				if ( groupLayoutKey === undefined ) return computeNode.id + ',' + stageCompute.id;
+
+				layoutKey += ',' + groupLayoutKey;
+
+			}
+
+			return 'shared:' + stageCompute.id + layoutKey;
+
+		}
 
 		return computeNode.id + ',' + stageCompute.id;
 
@@ -33486,10 +33545,10 @@ class Pipelines extends DataMap {
 	 */
 	_releaseProgram( program ) {
 
-		const code = program.code;
+		const key = program.cacheKey !== undefined ? program.cacheKey : program.code;
 		const stage = program.stage;
 
-		this.programs[ stage ].delete( code );
+		this.programs[ stage ].delete( key );
 
 		this.info.destroyProgram( program );
 
@@ -33506,7 +33565,23 @@ class Pipelines extends DataMap {
 
 		const data = this.get( computeNode );
 
-		return data.pipeline === undefined || data.version !== computeNode.version;
+		if ( data.pipeline === undefined || data.version !== computeNode.version ) return true;
+
+		if ( data.sharedKey !== undefined ) {
+
+			const shared = this.caches.get( data.sharedKey );
+
+			if ( shared !== undefined ) {
+
+				const sharedData = this.backend.get( shared );
+
+				return sharedData.pipeline !== undefined && sharedData.pipeline !== null;
+
+			}
+
+		}
+
+		return false;
 
 	}
 
@@ -44854,7 +44929,7 @@ class WorkgroupInfoNode extends Node {
 
 		}
 
-		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${this.id}`;
+		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${ builder.getScopedArrayIndex( this ) }`;
 
 		return builder.getScopedArray( name, this.scope.toLowerCase(), this.bufferType, this.bufferCount, this.isAtomic );
 
@@ -53144,6 +53219,22 @@ class NodeBuilder {
 		this.flowsData = new WeakMap();
 
 		/**
+		 * Per-builder indices of buffer nodes, used to name buffer bindings
+		 * independently of global node ids.
+		 *
+		 * @type {Map<Node,number>}
+		 */
+		this.bufferIndices = new Map();
+
+		/**
+		 * Per-builder indices of scoped array nodes (e.g. workgroup arrays), used to name
+		 * them independently of global node ids.
+		 *
+		 * @type {Map<Node,number>}
+		 */
+		this.scopedArrayIndices = new Map();
+
+		/**
 		 * The current shader stage.
 		 *
 		 * @type {?('vertex'|'fragment'|'compute'|'any')}
@@ -55979,6 +56070,52 @@ class NodeBuilder {
 		this.buildUpdateNodes();
 
 		return this;
+
+	}
+
+	/**
+	 * Returns a deterministic per-builder index for the given buffer node, assigned on first
+	 * request. Identical graphs therefore generate identical buffer names regardless of node ids.
+	 *
+	 * @param {Node} node - The buffer node.
+	 * @return {number} The index.
+	 */
+	getBufferIndex( node ) {
+
+		let index = this.bufferIndices.get( node );
+
+		if ( index === undefined ) {
+
+			index = this.bufferIndices.size;
+
+			this.bufferIndices.set( node, index );
+
+		}
+
+		return index;
+
+	}
+
+	/**
+	 * Returns a deterministic per-builder index for the given scoped array node, assigned on
+	 * first request.
+	 *
+	 * @param {Node} node - The scoped array node.
+	 * @return {number} The index.
+	 */
+	getScopedArrayIndex( node ) {
+
+		let index = this.scopedArrayIndices.get( node );
+
+		if ( index === undefined ) {
+
+			index = this.scopedArrayIndices.size;
+
+			this.scopedArrayIndices.set( node, index );
+
+		}
+
+		return index;
 
 	}
 
@@ -62323,6 +62460,16 @@ class Renderer {
 		this._compilationPromises = null;
 
 		/**
+		 * While not `null`, pipelines requested by `render()` and `compute()` are created
+		 * asynchronously and their promises are collected here. See `beginPipelineCollection()`.
+		 *
+		 * @private
+		 * @type {?Array<Promise>}
+		 * @default null
+		 */
+		this._pipelineCollection = null;
+
+		/**
 		 * Whether the renderer is currently precompiling a render object in
 		 * `compileAsync()`.
 		 *
@@ -62716,8 +62863,25 @@ class Renderer {
 		// Process compilation work items sequentially to avoid freezing
 		// Yields between objects to keep animation smooth
 
-		const total = compilationPromises.length;
-		let loaded = 0;
+		const count = compilationPromises.length;
+		const pipelinePromises = [];
+		const compiledObjects = [];
+
+		// Two integer steps per object: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = -1;
+
+		const report = ( loaded ) => {
+
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		for ( const item of compilationPromises ) {
 
@@ -62735,31 +62899,43 @@ class Renderer {
 			this._bindings.updateForRender( renderObject );
 			this._isPreCompiling = false;
 
-			// Wait for pipeline creation
-			const pipelinePromises = [];
+			// Pipelines are requested here but awaited together after the loop
 			this._pipelines.getForRender( renderObject, pipelinePromises );
-			if ( pipelinePromises.length > 0 ) {
 
-				await Promise.all( pipelinePromises );
+			compiledObjects.push( renderObject );
 
-			}
-
-			this._isPreCompiling = true;
-			this._nodes.updateAfter( renderObject );
-			this._isPreCompiling = false;
-
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
+			// Node building covers the first half of the progress
+			report( compiledObjects.length );
 
 			// Yield between objects to allow animation frames
 			await yieldToMain();
 
 		}
+
+		if ( pipelinePromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( count + Math.floor( count * settled / pipelinePromises.length ) );
+
+			};
+
+			await Promise.all( pipelinePromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const renderObject of compiledObjects ) {
+
+			this._isPreCompiling = true;
+			this._nodes.updateAfter( renderObject );
+			this._isPreCompiling = false;
+
+		}
+
+		report( total );
 
 	}
 
@@ -62787,14 +62963,32 @@ class Renderer {
 
 		}
 
-		const total = computeList.length;
-		let loaded = 0;
+		const count = computeList.length;
+
+		// Two integer steps per node: node building, then pipeline compilation.
+		const total = count * 2;
+		let reported = -1;
+
+		const report = ( loaded ) => {
+
+			if ( loaded > reported && onProgress !== null ) {
+
+				reported = loaded;
+
+				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
+
+			}
+
+		};
 
 		//
 
 		const pipelines = this._pipelines;
 		const bindings = this._bindings;
 		const nodes = this._nodes;
+
+		const compilationPromises = [];
+		let built = 0;
 
 		for ( const computeNode of computeList ) {
 
@@ -62829,24 +63023,39 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const compilationPromises = [];
 
 			pipelines.getForCompute( computeNode, computeBindings, compilationPromises );
-			await Promise.all( compilationPromises );
+
+			built ++;
+
+			report( built );
+
+			if ( built < count ) await yieldToMain();
+
+		}
+
+		if ( compilationPromises.length > 0 ) {
+
+			let settled = 0;
+
+			const onSettled = () => {
+
+				settled ++;
+				report( count + Math.floor( count * settled / compilationPromises.length ) );
+
+			};
+
+			await Promise.all( compilationPromises.map( ( promise ) => promise.then( onSettled, onSettled ) ) );
+
+		}
+
+		for ( const computeNode of computeList ) {
 
 			nodes.updateAfterForCompute( computeNode );
 
-			loaded ++;
-
-			if ( onProgress !== null ) {
-
-				onProgress( new ProgressEvent( 'progress', { lengthComputable: true, loaded, total } ) );
-
-			}
-
-			if ( loaded < total ) await yieldToMain();
-
 		}
+
+		report( total );
 
 	}
 
@@ -64351,6 +64560,17 @@ class Renderer {
 	}
 
 	/**
+	 * Submits GPU work the backend has deferred. The WebGPU backend batches the
+	 * command buffers of a frame and submits them at the end of the task, so call
+	 * this to submit earlier, e.g. before timing GPU work.
+	 */
+	flush() {
+
+		if ( this._initialized === true ) this.backend.flush();
+
+	}
+
+	/**
 	 * Frees all internal resources of the renderer. Call this method if the renderer
 	 * is no longer in use by your app.
 	 */
@@ -64619,7 +64839,9 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const computePipeline = pipelines.getForCompute( computeNode, computeBindings );
+			const computePipeline = pipelines.getForCompute( computeNode, computeBindings, this._pipelineCollection );
+
+			if ( pipelines.isReady( computeNode ) === false ) continue;
 
 			backend.compute( computeNodes, computeNode, computeBindings, computePipeline, dispatchSize );
 
@@ -64655,6 +64877,32 @@ class Renderer {
 		if ( this._initialized === false ) await this.init();
 
 		this.compute( computeNodes, dispatchSize );
+
+	}
+
+	/**
+	 * Starts collecting pipeline creations. Until `endPipelineCollection()` is called, every
+	 * pipeline that `render()` or `compute()` needs is created asynchronously, in parallel,
+	 * and draws or dispatches using it are skipped until it is ready.
+	 */
+	beginPipelineCollection() {
+
+		this._pipelineCollection = [];
+
+	}
+
+	/**
+	 * Stops collecting pipeline creations started with `beginPipelineCollection()`.
+	 *
+	 * @return {Array<Promise>} The promises of the pipelines requested while collecting. They resolve also when creation fails.
+	 */
+	endPipelineCollection() {
+
+		const promises = this._pipelineCollection || [];
+
+		this._pipelineCollection = null;
+
+		return promises;
 
 	}
 
@@ -65549,7 +65797,7 @@ class Renderer {
 
 		}
 
-		this._pipelines.updateForRender( renderObject );
+		this._pipelines.updateForRender( renderObject, this._pipelineCollection );
 
 		//
 
@@ -65613,7 +65861,7 @@ class Renderer {
 		this._nodes.updateForRender( renderObject );
 		this._bindings.updateForRender( renderObject );
 
-		this._pipelines.getForRender( renderObject, this._compilationPromises );
+		this._pipelines.getForRender( renderObject, this._pipelineCollection );
 
 		this._nodes.updateAfter( renderObject );
 
@@ -67875,7 +68123,7 @@ ${ flowData.code }
 				const bufferCount = bufferNode.bufferCount;
 
 				const bufferCountSnippet = bufferCount > 0 ? bufferCount : '';
-				snippet = `${bufferNode.name} {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
+				snippet = `${ uniform.blockName } {\n\t${ bufferType } ${ uniform.name }[${ bufferCountSnippet }];\n};\n`;
 
 			} else {
 
@@ -68729,7 +68977,10 @@ void main() {
 
 			} else if ( type === 'buffer' ) {
 
-				uniformNode.name = `buffer${ node.id }`;
+				const bufferIndex = this.getBufferIndex( node );
+
+				uniformNode.name = `buffer${ bufferIndex }`;
+				uniformNode.blockName = `NodeBuffer_${ bufferIndex }`;
 
 				const sharedData = this.getSharedDataFromNode( node );
 
@@ -68737,10 +68988,8 @@ void main() {
 
 				if ( buffer === undefined ) {
 
-					node.name = `NodeBuffer_${ node.id }`;
-
 					buffer = new NodeUniformBuffer( node, group );
-					buffer.name = node.name;
+					buffer.name = uniformNode.blockName;
 
 					sharedData.buffer = buffer;
 
@@ -69610,6 +69859,12 @@ class Backend {
 	 * @param {BindGroup} bindGroup - The bind group.
 	 */
 	deleteBindGroupData( /*bindGroup*/ ) { }
+
+	/**
+	 * Submits GPU work the backend has deferred. A no-op for backends
+	 * that submit immediately.
+	 */
+	flush() { }
 
 	/**
 	 * Frees internal resources.
@@ -75867,6 +76122,8 @@ class WebGLBackend extends Backend {
 		// Bindings (must be after link completion)
 		this._setupBindings( bindings, programGPU );
 
+		this.get( computePipeline ).pipeline = programGPU;
+
 	}
 
 	/**
@@ -77425,6 +77682,550 @@ class NodeStorageBuffer extends StorageBuffer {
 
 }
 
+const _queues = new WeakMap();
+
+const _wrappedMethods = [ 'submit', 'onSubmittedWorkDone', 'writeBuffer', 'writeTexture', 'copyExternalImageToTexture', 'copyElementImageToTexture' ];
+
+const _stagingMinSize = 262144;
+const _stagingMaxSize = 4194304;
+
+const _stagingDescriptor = { label: 'WebGPUCommandQueue.staging', size: 0, usage: 0 };
+const _uploadEncoderDescriptor = { label: 'WebGPUCommandQueue.writes' };
+
+/**
+ * Returns the byte length a `writeBuffer()` call would write, or `-1` if the
+ * arguments are not a valid in-range write.
+ *
+ * @private
+ * @param {BufferSource} data - The source data.
+ * @param {number} [dataOffset=0] - Offset into `data`, in elements for typed arrays and in bytes otherwise.
+ * @param {number} [size] - Size of the write, in the same units as `dataOffset`.
+ * @return {number} The byte length.
+ */
+function getWriteByteLength( data, dataOffset = 0, size = undefined ) {
+
+	if ( data === null || typeof data !== 'object' ) return -1;
+
+	const elementSize = data.BYTES_PER_ELEMENT !== undefined ? data.BYTES_PER_ELEMENT : 1;
+	const length = data.BYTES_PER_ELEMENT !== undefined ? data.length : data.byteLength;
+	const count = size === undefined ? length - dataOffset : size;
+
+	if ( Number.isInteger( length ) === false || Number.isInteger( dataOffset ) === false || Number.isInteger( count ) === false ) return -1;
+	if ( dataOffset < 0 || count < 0 || dataOffset + count > length ) return -1;
+
+	return count * elementSize;
+
+}
+
+/**
+ * Defers command buffer submission so a frame reaches the GPU in as few
+ * `queue.submit()` calls as possible. Pending command buffers are flushed at
+ * the end of the frame and before any readback.
+ *
+ * A queue write executes before every command buffer submitted after it, so a
+ * buffer write made while command buffers are pending is staged instead and
+ * copied by a command buffer appended at that point, keeping the order of
+ * immediate submission. Texture writes flush first.
+ *
+ * @private
+ */
+class WebGPUCommandQueue {
+
+	/**
+	 * Constructs a new command queue for the given device and wraps the
+	 * device's `GPUQueue` so writes and external submits are ordered correctly.
+	 *
+	 * @param {GPUDevice} device - The GPU device.
+	 * @param {?Function} [onError=null] - Receives validation errors raised by deferred submits, plus an optional explanatory message.
+	 */
+	constructor( device, onError = null ) {
+
+		/**
+		 * The GPU device.
+		 *
+		 * @type {GPUDevice}
+		 */
+		this.device = device;
+
+		/**
+		 * The wrapped GPU queue.
+		 *
+		 * @type {GPUQueue}
+		 */
+		this.queue = device.queue;
+
+		/**
+		 * Receives validation errors raised by deferred submits, plus an optional
+		 * explanatory message.
+		 *
+		 * @type {?Function}
+		 */
+		this.onError = onError;
+
+		/**
+		 * Command buffers waiting to be submitted.
+		 *
+		 * @type {Array<GPUCommandBuffer>}
+		 */
+		this.pending = [];
+
+		/**
+		 * Records the copies of staged buffer writes made since the last pending
+		 * command buffer. It is finished and appended before the next one.
+		 *
+		 * @type {?GPUCommandEncoder}
+		 */
+		this.uploadEncoder = null;
+
+		/**
+		 * Holds the data of staged buffer writes until the next flush.
+		 *
+		 * @type {?GPUBuffer}
+		 */
+		this.staging = null;
+
+		/**
+		 * Bytes of `staging` used since the last flush.
+		 *
+		 * @type {number}
+		 */
+		this.stagingOffset = 0;
+
+		/**
+		 * Resources whose destruction waits for the next flush.
+		 *
+		 * @type {Array<GPUBuffer|GPUTexture|GPUQuerySet>}
+		 */
+		this.destroyQueue = [];
+
+		/**
+		 * Set when the device is lost; pending work is dropped from then on.
+		 *
+		 * @type {boolean}
+		 */
+		this.isLost = false;
+
+		/**
+		 * Remaining frame-end flushes with work that submit each command buffer on its own.
+		 * Set after a batched submit fails, since one invalid command buffer makes
+		 * `queue.submit()` reject the whole batch.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackFlushes = 0;
+
+		/**
+		 * Length of the next per-command-buffer fallback window, in frame-end flushes. Doubles
+		 * each time batching is retried and fails again.
+		 *
+		 * @type {number}
+		 */
+		this.fallbackLength = 120;
+
+		this._flushQueued = false;
+		this._fallbackLogged = false;
+		this._fallbackWindow = 0;
+		this._single = [ null ];
+
+		this._frameFlush = () => {
+
+			this._flushQueued = false;
+			this.flush( true );
+
+		};
+
+		this._onSubmitError = ( err ) => {
+
+			if ( err === null ) return;
+
+			if ( this.fallbackFlushes > 0 ) this.fallbackFlushes = this._fallbackWindow;
+
+			if ( this.onError !== null ) this.onError( err );
+
+		};
+
+		this._onBatchSubmitError = ( err ) => {
+
+			if ( err === null || this.fallbackFlushes > 0 ) return;
+
+			this._fallbackWindow = this.fallbackLength;
+			this.fallbackFlushes = this._fallbackWindow;
+			this.fallbackLength = Math.min( this.fallbackLength * 2, 7680 );
+
+			if ( this.onError === null ) return;
+
+			if ( this._fallbackLogged === false ) {
+
+				this._fallbackLogged = true;
+
+				this.onError( err, `${ err.message } (A batched queue.submit() was rejected because one of its command buffers is invalid, so all work in that batch was lost. Command buffers are now submitted individually for ${ this.fallbackFlushes } frames before batching is retried.)` );
+
+			} else {
+
+				this.onError( err );
+
+			}
+
+		};
+
+		this._install();
+
+		_queues.set( device, this );
+
+	}
+
+	/**
+	 * Returns the command queue registered for the given device.
+	 *
+	 * @param {GPUDevice} device - The GPU device.
+	 * @return {?WebGPUCommandQueue} The command queue, or `null`.
+	 */
+	static get( device ) {
+
+		return _queues.get( device ) || null;
+
+	}
+
+	/**
+	 * Appends a command buffer to the pending list.
+	 *
+	 * @param {GPUCommandBuffer} commandBuffer - The command buffer.
+	 */
+	submit( commandBuffer ) {
+
+		if ( this.isLost === true ) return;
+
+		this._closeUploads();
+
+		this.pending.push( commandBuffer );
+
+		this._queueFlush();
+
+	}
+
+	/**
+	 * Stages a buffer write while command buffers are pending, so it executes
+	 * after them and before command buffers appended later. Returns `false` when
+	 * the caller must write directly, after flushing if ordering requires it.
+	 *
+	 * @param {GPUBuffer} buffer - The destination buffer.
+	 * @param {number} bufferOffset - The byte offset into `buffer`.
+	 * @param {BufferSource} data - The source data.
+	 * @param {number} [dataOffset] - Offset into `data`, in elements for typed arrays and in bytes otherwise.
+	 * @param {number} [size] - Size of the write, in the same units as `dataOffset`.
+	 * @return {boolean} Whether the write was staged.
+	 */
+	stageWrite( buffer, bufferOffset, data, dataOffset, size ) {
+
+		if ( this.pending.length === 0 || this.isLost === true ) return false;
+
+		const byteLength = getWriteByteLength( data, dataOffset, size );
+
+		if ( byteLength === 0 ) return false;
+
+		if ( byteLength < 0 || byteLength > _stagingMaxSize || Number.isInteger( bufferOffset ) === false || bufferOffset < 0 || ( bufferOffset % 4 ) !== 0 || ( byteLength % 4 ) !== 0 ||
+			bufferOffset + byteLength > buffer.size || ( buffer.usage & GPUBufferUsage.COPY_DST ) === 0 || buffer.mapState !== 'unmapped' ) {
+
+			this.flush();
+
+			return false;
+
+		}
+
+		let staging = this.staging;
+
+		if ( staging === null || this.stagingOffset + byteLength > staging.size ) {
+
+			if ( staging !== null && staging.size >= _stagingMaxSize ) {
+
+				this.flush();
+
+				return false;
+
+			}
+
+			let stagingSize = staging === null ? _stagingMinSize : staging.size * 2;
+
+			while ( stagingSize < byteLength ) stagingSize *= 2;
+
+			if ( staging !== null ) this.destroyQueue.push( staging );
+
+			_stagingDescriptor.size = Math.min( stagingSize, _stagingMaxSize );
+			_stagingDescriptor.usage = GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+
+			staging = this.device.createBuffer( _stagingDescriptor );
+
+			this.staging = staging;
+			this.stagingOffset = 0;
+
+		}
+
+		const offset = this.stagingOffset;
+
+		Object.getPrototypeOf( this.queue ).writeBuffer.call( this.queue, staging, offset, data, dataOffset, size );
+
+		if ( this.uploadEncoder === null ) this.uploadEncoder = this.device.createCommandEncoder( _uploadEncoderDescriptor );
+
+		this.uploadEncoder.copyBufferToBuffer( staging, offset, buffer, bufferOffset, byteLength );
+
+		this.stagingOffset = offset + byteLength;
+
+		this._queueFlush();
+
+		return true;
+
+	}
+
+	/**
+	 * Flushes pending command buffers before a queue write to a texture, which
+	 * would otherwise execute ahead of them.
+	 */
+	writeTexture() {
+
+		if ( this.pending.length > 0 ) this.flush();
+
+	}
+
+	/**
+	 * Destroys the given resource, after the next flush if command buffers
+	 * that may reference it are still pending.
+	 *
+	 * @param {GPUBuffer|GPUTexture|GPUQuerySet} resource - The resource.
+	 */
+	destroy( resource ) {
+
+		if ( this.pending.length > 0 ) {
+
+			this.destroyQueue.push( resource );
+
+		} else {
+
+			resource.destroy();
+
+		}
+
+	}
+
+	/**
+	 * Submits all pending command buffers in one `queue.submit()` call.
+	 *
+	 * @param {boolean} [frameEnd=false] - Whether this flush ends the frame, which counts down the per-command-buffer fallback.
+	 */
+	flush( frameEnd = false ) {
+
+		this._closeUploads();
+
+		const pending = this.pending;
+
+		if ( pending.length > 0 && this.isLost === false ) {
+
+			const queue = this.queue;
+			const device = this.device;
+
+			const submitGPU = Object.getPrototypeOf( queue ).submit;
+
+			device.pushErrorScope( 'validation' );
+
+			if ( this.fallbackFlushes > 0 || pending.length === 1 ) {
+
+				const single = this._single;
+
+				for ( let i = 0; i < pending.length; i ++ ) {
+
+					single[ 0 ] = pending[ i ];
+					submitGPU.call( queue, single );
+
+				}
+
+				single[ 0 ] = null;
+
+				device.popErrorScope().then( this._onSubmitError );
+
+				if ( frameEnd === true && this.fallbackFlushes > 0 ) this.fallbackFlushes --;
+
+			} else {
+
+				submitGPU.call( queue, pending );
+
+				device.popErrorScope().then( this._onBatchSubmitError );
+
+			}
+
+		}
+
+		pending.length = 0;
+		this.stagingOffset = 0;
+
+		const destroyQueue = this.destroyQueue;
+
+		if ( destroyQueue.length > 0 ) {
+
+			for ( let i = 0; i < destroyQueue.length; i ++ ) destroyQueue[ i ].destroy();
+
+			destroyQueue.length = 0;
+
+		}
+
+	}
+
+	/**
+	 * Drops all pending work after a device loss.
+	 */
+	lose() {
+
+		this.isLost = true;
+		this.pending.length = 0;
+		this.uploadEncoder = null;
+		this.stagingOffset = 0;
+
+		for ( const resource of this.destroyQueue ) resource.destroy();
+
+		this.destroyQueue.length = 0;
+
+		if ( this.staging !== null ) {
+
+			this.staging.destroy();
+			this.staging = null;
+
+		}
+
+	}
+
+	/**
+	 * Flushes pending work and restores the original queue methods.
+	 */
+	dispose() {
+
+		this.flush( true );
+
+		if ( this.staging !== null ) {
+
+			this.staging.destroy();
+			this.staging = null;
+
+		}
+
+		const queue = this.queue;
+
+		for ( const name of _wrappedMethods ) {
+
+			if ( Object.prototype.hasOwnProperty.call( queue, name ) ) delete queue[ name ];
+
+		}
+
+		_queues.delete( this.device );
+
+	}
+
+	/**
+	 * Appends the command buffer holding the copies of staged writes, if any.
+	 *
+	 * @private
+	 */
+	_closeUploads() {
+
+		if ( this.uploadEncoder !== null ) {
+
+			const uploadEncoder = this.uploadEncoder;
+
+			this.uploadEncoder = null;
+
+			if ( this.isLost === false ) this.pending.push( uploadEncoder.finish() );
+
+		}
+
+	}
+
+	/**
+	 * Schedules a frame-end flush at the next microtask checkpoint, which runs
+	 * before the current task ends and the canvas texture is presented.
+	 *
+	 * @private
+	 */
+	_queueFlush() {
+
+		if ( this._flushQueued === false ) {
+
+			this._flushQueued = true;
+
+			queueMicrotask( this._frameFlush );
+
+		}
+
+	}
+
+	/**
+	 * Wraps the queue methods as own properties of the queue instance. The
+	 * prototype methods are looked up at call time so later wrappers still apply.
+	 *
+	 * @private
+	 */
+	_install() {
+
+		const scope = this;
+		const queue = this.queue;
+		const proto = Object.getPrototypeOf( queue );
+
+		queue.submit = function ( commandBuffers ) {
+
+			scope.flush();
+
+			return proto.submit.call( queue, commandBuffers );
+
+		};
+
+		queue.onSubmittedWorkDone = function () {
+
+			scope.flush();
+
+			return proto.onSubmittedWorkDone.call( queue );
+
+		};
+
+		queue.writeBuffer = function ( buffer, bufferOffset, data, dataOffset, size ) {
+
+			if ( scope.stageWrite( buffer, bufferOffset, data, dataOffset, size ) === true ) return;
+
+			return proto.writeBuffer.apply( queue, arguments );
+
+		};
+
+		queue.writeTexture = function () {
+
+			scope.writeTexture();
+
+			return proto.writeTexture.apply( queue, arguments );
+
+		};
+
+		queue.copyExternalImageToTexture = function () {
+
+			scope.writeTexture();
+
+			return proto.copyExternalImageToTexture.apply( queue, arguments );
+
+		};
+
+		if ( typeof proto.copyElementImageToTexture === 'function' ) {
+
+			const copyElementImageToTexture = function () {
+
+				scope.writeTexture();
+
+				return proto.copyElementImageToTexture.apply( queue, arguments );
+
+			};
+
+			Object.defineProperty( copyElementImageToTexture, 'length', { value: proto.copyElementImageToTexture.length } );
+
+			queue.copyElementImageToTexture = copyElementImageToTexture;
+
+		}
+
+	}
+
+}
+
 const _commandList = [ null ];
 
 /**
@@ -77720,8 +78521,8 @@ class WebGPUUtils {
 }
 
 /**
- * Submits a single GPU command to the device queue using a shared, module-scoped
- * array to avoid per-call array allocations.
+ * Submits a single GPU command. If the device has a command queue, the command
+ * is deferred until the queue flushes; otherwise it is submitted immediately.
  *
  * @private
  * @param {GPUDevice} device - The GPU device.
@@ -77729,11 +78530,59 @@ class WebGPUUtils {
  */
 function submit( device, command ) {
 
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) {
+
+		commandQueue.submit( command );
+		return;
+
+	}
+
 	_commandList[ 0 ] = command;
 
 	device.queue.submit( _commandList );
 
 	_commandList[ 0 ] = null;
+
+}
+
+/**
+ * Submits all deferred commands of the given device. Must be called before
+ * mapping a buffer that pending commands write to.
+ *
+ * @private
+ * @param {GPUDevice} device - The GPU device.
+ */
+function flush( device ) {
+
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) commandQueue.flush();
+
+}
+
+/**
+ * Destroys a GPU resource, after the next flush if deferred commands may
+ * still reference it.
+ *
+ * @private
+ * @param {GPUDevice} device - The GPU device.
+ * @param {GPUBuffer|GPUTexture|GPUQuerySet} resource - The resource to destroy.
+ */
+function destroyResource( device, resource ) {
+
+	const commandQueue = WebGPUCommandQueue.get( device );
+
+	if ( commandQueue !== null ) {
+
+		commandQueue.destroy( resource );
+
+	} else {
+
+		resource.destroy();
+
+	}
 
 }
 
@@ -78755,7 +79604,7 @@ fn main_cube( Varys: VarysStruct ) -> @location( 0 ) vec4<f32> {
 
 		submit( this.device, commandEncoder.finish() );
 
-		tempTexture.destroy();
+		destroyResource( this.device, tempTexture );
 
 	}
 
@@ -79774,13 +80623,15 @@ class WebGPUTextureUtils {
 		const backend = this.backend;
 		const textureData = backend.get( texture );
 
-		if ( textureData.texture !== undefined && isDefaultTexture === false && texture.isExternalTexture !== true && textureData.externalTexture !== true ) textureData.texture.destroy();
+		const device = backend.device;
 
-		if ( textureData.msaaTexture !== undefined ) textureData.msaaTexture.destroy();
+		if ( textureData.texture !== undefined && isDefaultTexture === false && texture.isExternalTexture !== true && textureData.externalTexture !== true ) destroyResource( device, textureData.texture );
+
+		if ( textureData.msaaTexture !== undefined ) destroyResource( device, textureData.msaaTexture );
 
 		if ( textureData.msaaTextures !== undefined ) {
 
-			for ( const msaaTexture of textureData.msaaTextures ) msaaTexture.destroy();
+			for ( const msaaTexture of textureData.msaaTextures ) destroyResource( device, msaaTexture );
 
 		}
 
@@ -79828,7 +80679,7 @@ class WebGPUTextureUtils {
 
 		let colorBuffer = colorTextureData.texture;
 
-		if ( colorBuffer ) colorBuffer.destroy();
+		if ( colorBuffer ) destroyResource( backend.device, colorBuffer );
 
 		_textureDescriptor$1.label = 'colorBuffer';
 		_textureDescriptor$1.size.width = width;
@@ -80136,6 +80987,7 @@ class WebGPUTextureUtils {
 		const typedArrayType = this._getTypedArrayType( format );
 
 		submit( device, encoder.finish() );
+		flush( device );
 
 		await readBuffer.mapAsync( GPUMapMode.READ );
 
@@ -82751,7 +83603,7 @@ class WGSLNodeBuilder extends NodeBuilder {
 
 				uniformGPU = buffer;
 
-				uniformNode.name = name ? name : 'NodeBuffer_' + uniformNode.id;
+				uniformNode.name = name ? name : 'NodeBuffer_' + this.getBufferIndex( node );
 
 			} else {
 
@@ -84460,7 +85312,7 @@ class WebGPUAttributeUtils {
 		const backend = this.backend;
 		const data = backend.get( this._getBufferAttribute( attribute ) );
 
-		data.buffer.destroy();
+		destroyResource( backend.device, data.buffer );
 
 		backend.delete( attribute );
 
@@ -84576,6 +85428,7 @@ class WebGPUAttributeUtils {
 
 		const gpuCommands = cmdEncoder.finish();
 		submit( device, gpuCommands );
+		flush( device );
 
 		// map the data to the CPU
 		await readBufferGPU.mapAsync( GPUMapMode.READ, 0, byteLength );
@@ -85726,6 +86579,10 @@ class WebGPUPipelineUtils {
 
 					_renderPipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -85740,7 +86597,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -85883,6 +86740,10 @@ class WebGPUPipelineUtils {
 
 					_computePipelineDescriptor.reset();
 
+					// Pop before the first await: scopes are a device-wide stack, so an open
+					// scope would capture errors from other pipelines and unrelated commands.
+					const errorScopePromise = device.popErrorScope();
+
 					if ( pipelinePromise !== null ) {
 
 						try {
@@ -85897,7 +86758,7 @@ class WebGPUPipelineUtils {
 
 					}
 
-					const errorScope = await device.popErrorScope();
+					const errorScope = await errorScopePromise;
 
 					if ( errorScope !== null || asyncError !== null ) {
 
@@ -85914,11 +86775,15 @@ class WebGPUPipelineUtils {
 
 					// Guarantee resolution so `compileComputeAsync`'s Promise.all cannot hang on an
 					// unexpected throw from any await above.
+					pipelineGPU.promise = undefined;
+
 					resolve();
 
 				}
 
 			} );
+
+			pipelineGPU.promise = promise;
 
 			promises.push( promise );
 
@@ -86646,6 +87511,7 @@ class WebGPUTimestampQueryPool extends TimestampQueryPool {
 
 			const commandBuffer = commandEncoder.finish();
 			submit( this.device, commandBuffer );
+			flush( this.device );
 
 			if ( this.resultBuffer.mapState !== 'unmapped' ) {
 
@@ -87071,6 +87937,15 @@ class WebGPUBackend extends Backend {
 		this.device = null;
 
 		/**
+		 * Defers command buffer submission per frame.
+		 *
+		 * @private
+		 * @type {?WebGPUCommandQueue}
+		 * @default null
+		 */
+		this._commandQueue = null;
+
+		/**
 		 * A reference to the default render pass descriptor.
 		 *
 		 * @type {?Object}
@@ -87219,7 +88094,24 @@ class WebGPUBackend extends Backend {
 
 		}
 
+		this._commandQueue = WebGPUCommandQueue.get( device ) || new WebGPUCommandQueue( device );
+
+		this._commandQueue.onError = ( gpuError, message = null ) => {
+
+			renderer.onError( {
+				api: 'WebGPU',
+				type: gpuError.constructor ? gpuError.constructor.name : 'GPUError',
+				message: message || gpuError.message || 'Unknown GPU error in deferred submit',
+				originalEvent: null
+			} );
+
+		};
+
 		device.lost.then( ( info ) => {
+
+			const commandQueue = WebGPUCommandQueue.get( device );
+
+			if ( commandQueue !== null ) commandQueue.lose();
 
 			if ( info.reason === 'destroyed' ) return;
 
@@ -87506,7 +88398,7 @@ class WebGPUBackend extends Backend {
 
 			if ( textureData.msaaTextures !== undefined ) {
 
-				for ( const texture of textureData.msaaTextures ) texture.destroy();
+				for ( const texture of textureData.msaaTextures ) destroyResource( this.device, texture );
 
 				textureData.msaaTextures = undefined;
 
@@ -87530,7 +88422,7 @@ class WebGPUBackend extends Backend {
 
 			if ( textureData.msaaTextures !== undefined ) {
 
-				for ( const texture of textureData.msaaTextures ) texture.destroy();
+				for ( const texture of textureData.msaaTextures ) destroyResource( this.device, texture );
 
 			}
 
@@ -87848,8 +88740,8 @@ class WebGPUBackend extends Backend {
 
 		if ( occlusionQueryCount > 0 ) {
 
-			if ( renderContextData.currentOcclusionQuerySet ) renderContextData.currentOcclusionQuerySet.destroy();
-			if ( renderContextData.currentOcclusionQueryBuffer ) renderContextData.currentOcclusionQueryBuffer.destroy();
+			if ( renderContextData.currentOcclusionQuerySet ) destroyResource( device, renderContextData.currentOcclusionQuerySet );
+			if ( renderContextData.currentOcclusionQueryBuffer ) destroyResource( device, renderContextData.currentOcclusionQueryBuffer );
 
 			// Get a reference to the array of objects with queries. The renderContextData property
 			// can be changed by another render pass before the buffer.mapAsyc() completes.
@@ -87879,7 +88771,7 @@ class WebGPUBackend extends Backend {
 
 			renderContextData.lastOcclusionObject = undefined;
 
-			renderContextData.occlusionQuerySet.destroy();
+			destroyResource( device, renderContextData.occlusionQuerySet );
 			renderContextData.occlusionQuerySet = undefined;
 
 		}
@@ -88520,6 +89412,7 @@ class WebGPUBackend extends Backend {
 
 		submit( this.device, renderContextData.encoder.finish() );
 
+		if ( renderContext.textures === null && this._commandQueue !== null ) this._commandQueue.flush( true );
 
 		//
 
@@ -88581,6 +89474,8 @@ class WebGPUBackend extends Backend {
 
 			renderContextData.currentOcclusionQueryObjects = null;
 			renderContextData.currentOcclusionQueryBuffer = null;
+
+			flush( this.device );
 
 			await currentOcclusionQueryBuffer.mapAsync( GPUMapMode.READ );
 
@@ -88798,6 +89693,8 @@ class WebGPUBackend extends Backend {
 
 		submit( device, encoder.finish() );
 
+		if ( renderTargetContext === null && this._commandQueue !== null ) this._commandQueue.flush( true );
+
 	}
 
 	// compute
@@ -88850,7 +89747,12 @@ class WebGPUBackend extends Backend {
 
 		// pipeline
 
-		const pipelineGPU = this.get( pipeline ).pipeline;
+		const pipelineData = this.get( pipeline );
+
+		// Skip if pipeline has error, so one broken kernel does not invalidate the batch
+		if ( pipelineData.error === true ) return;
+
+		const pipelineGPU = pipelineData.pipeline;
 
 		if ( groupGPU.currentPipeline !== pipelineGPU ) {
 
@@ -89755,7 +90657,7 @@ class WebGPUBackend extends Backend {
 
 		const uniformBufferData = this.get( uniformBuffer );
 
-		uniformBufferData.buffer.destroy();
+		destroyResource( this.device, uniformBufferData.buffer );
 
 		this.delete( uniformBuffer );
 
@@ -90205,7 +91107,19 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Submits all deferred command buffers in one `queue.submit()` call.
+	 */
+	flush() {
+
+		if ( this._commandQueue !== null ) this._commandQueue.flush();
+
+	}
+
 	async dispose() {
+
+		// Submit deferred command buffers before their query sets and buffers are destroyed.
+		if ( this._commandQueue !== null ) this._commandQueue.flush( true );
 
 		await super.dispose();
 
@@ -90216,11 +91130,18 @@ class WebGPUBackend extends Backend {
 
 			for ( const buffer of this.occludedResolveCache.values() ) {
 
-				buffer.destroy();
+				destroyResource( this.device, buffer );
 
 			}
 
 			this.occludedResolveCache.clear();
+
+		}
+
+		if ( this._commandQueue !== null ) {
+
+			this._commandQueue.dispose();
+			this._commandQueue = null;
 
 		}
 

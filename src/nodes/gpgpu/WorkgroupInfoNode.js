@@ -248,7 +248,7 @@ class WorkgroupInfoNode extends Node {
 
 		}
 
-		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${this.id}`;
+		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${ builder.getScopedArrayIndex( this ) }`;
 
 		return builder.getScopedArray( name, this.scope.toLowerCase(), this.bufferType, this.bufferCount, this.isAtomic );
 

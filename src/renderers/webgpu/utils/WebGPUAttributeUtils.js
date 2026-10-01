@@ -1,5 +1,5 @@
 import { GPUInputStepMode } from './WebGPUConstants.js';
-import { submit } from './WebGPUUtils.js';
+import { submit, flush, destroyResource } from './WebGPUUtils.js';
 import GPUBufferDescriptor from '../descriptors/GPUBufferDescriptor.js';
 import GPUCommandEncoderDescriptor from '../descriptors/GPUCommandEncoderDescriptor.js';
 
@@ -354,7 +354,7 @@ class WebGPUAttributeUtils {
 		const backend = this.backend;
 		const data = backend.get( this._getBufferAttribute( attribute ) );
 
-		data.buffer.destroy();
+		destroyResource( backend.device, data.buffer );
 
 		backend.delete( attribute );
 
@@ -470,6 +470,7 @@ class WebGPUAttributeUtils {
 
 		const gpuCommands = cmdEncoder.finish();
 		submit( device, gpuCommands );
+		flush( device );
 
 		// map the data to the CPU
 		await readBufferGPU.mapAsync( GPUMapMode.READ, 0, byteLength );

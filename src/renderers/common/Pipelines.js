@@ -107,14 +107,19 @@ class Pipelines extends DataMap {
 
 			// programmable stage
 
-			let stageCompute = this.programs.compute.get( nodeBuilderState.computeShader );
+			// WebGPU stages only carry code and are shared; WebGL stages carry per-node transforms and attributes
+
+			const programKey = backend.isWebGPUBackend === true ? nodeBuilderState.computeShader : computeNode.id + ',' + nodeBuilderState.computeShader;
+
+			let stageCompute = this.programs.compute.get( programKey );
 
 			if ( stageCompute === undefined ) {
 
 				if ( previousPipeline && previousPipeline.computeProgram.usedTimes === 0 ) this._releaseProgram( previousPipeline.computeProgram );
 
 				stageCompute = new ProgrammableStage( nodeBuilderState.computeShader, 'compute', computeNode.name, nodeBuilderState.transforms, nodeBuilderState.nodeAttributes );
-				this.programs.compute.set( nodeBuilderState.computeShader, stageCompute );
+				stageCompute.cacheKey = programKey;
+				this.programs.compute.set( programKey, stageCompute );
 
 				backend.createProgram( stageCompute );
 				this.info.createProgram( stageCompute );
@@ -123,15 +128,45 @@ class Pipelines extends DataMap {
 
 			// determine compute pipeline
 
-			const cacheKey = this._getComputeCacheKey( computeNode, stageCompute );
+			let cacheKey = this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 			let pipeline = this.caches.get( cacheKey );
+
+			data.sharedKey = undefined;
+
+			if ( pipeline !== undefined && backend.isWebGPUBackend === true ) {
+
+				const pipelineData = backend.get( pipeline );
+
+				if ( pipelineData.pipeline === undefined ) {
+
+					if ( promises !== null && pipelineData.promise !== undefined ) {
+
+						if ( promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
+
+					} else {
+
+						// a shared pipeline that failed, or is still compiling for a sync caller, can't be dispatched, so build a per-node one
+
+						data.sharedKey = cacheKey;
+						cacheKey = computeNode.id + ',' + stageCompute.id;
+						pipeline = this.caches.get( cacheKey );
+
+					}
+
+				}
+
+			}
 
 			if ( pipeline === undefined ) {
 
 				if ( previousPipeline && previousPipeline.usedTimes === 0 ) this._releasePipeline( previousPipeline );
 
 				pipeline = this._getComputePipeline( computeNode, stageCompute, cacheKey, bindings, promises );
+
+			} else if ( previousPipeline && previousPipeline !== pipeline && previousPipeline.usedTimes === 0 ) {
+
+				this._releasePipeline( previousPipeline );
 
 			}
 
@@ -247,11 +282,11 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Checks if the render pipeline for the given render object is ready for drawing.
-	 * Returns false if the GPU pipeline is still being compiled asynchronously.
+	 * Checks if the pipeline for the given render object or compute node is ready for drawing
+	 * or dispatching. Returns false if the GPU pipeline is still being compiled asynchronously.
 	 *
-	 * @param {RenderObject} renderObject - The render object.
-	 * @return {boolean} True if the pipeline is ready for drawing.
+	 * @param {RenderObject|Node} renderObject - The render object or compute node.
+	 * @return {boolean} True if the pipeline is ready.
 	 */
 	isReady( renderObject ) {
 
@@ -328,10 +363,11 @@ class Pipelines extends DataMap {
 	 * Updates the pipeline for the given render object.
 	 *
 	 * @param {RenderObject} renderObject - The render object.
+	 * @param {?Array<Promise>} [promises=null] - If set, a new pipeline is created asynchronously and its promise is pushed here.
 	 */
-	updateForRender( renderObject ) {
+	updateForRender( renderObject, promises = null ) {
 
-		this.getForRender( renderObject );
+		this.getForRender( renderObject, promises );
 
 	}
 
@@ -350,7 +386,7 @@ class Pipelines extends DataMap {
 
 		// check for existing pipeline
 
-		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute );
+		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 		let pipeline = this.caches.get( cacheKey );
 
@@ -408,14 +444,37 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Computes a cache key representing a compute pipeline.
+	 * Computes a cache key representing a compute pipeline. On WebGPU, compute nodes with
+	 * the same shader program and equivalent bind group layouts share one pipeline. The
+	 * WebGL backend stores per-node state on the pipeline, so it keeps one per node.
 	 *
 	 * @private
 	 * @param {Node} computeNode - The compute node.
 	 * @param {ProgrammableStage} stageCompute - The programmable stage representing the compute shader.
+	 * @param {Array<BindGroup>} bindings - The bindings.
 	 * @return {string} The cache key.
 	 */
-	_getComputeCacheKey( computeNode, stageCompute ) {
+	_getComputeCacheKey( computeNode, stageCompute, bindings ) {
+
+		const { backend } = this;
+
+		if ( backend.isWebGPUBackend === true && bindings ) {
+
+			let layoutKey = '';
+
+			for ( const bindGroup of bindings ) {
+
+				const groupLayoutKey = backend.get( bindGroup ).layoutKey;
+
+				if ( groupLayoutKey === undefined ) return computeNode.id + ',' + stageCompute.id;
+
+				layoutKey += ',' + groupLayoutKey;
+
+			}
+
+			return 'shared:' + stageCompute.id + layoutKey;
+
+		}
 
 		return computeNode.id + ',' + stageCompute.id;
 
@@ -456,10 +515,10 @@ class Pipelines extends DataMap {
 	 */
 	_releaseProgram( program ) {
 
-		const code = program.code;
+		const key = program.cacheKey !== undefined ? program.cacheKey : program.code;
 		const stage = program.stage;
 
-		this.programs[ stage ].delete( code );
+		this.programs[ stage ].delete( key );
 
 		this.info.destroyProgram( program );
 
@@ -476,7 +535,23 @@ class Pipelines extends DataMap {
 
 		const data = this.get( computeNode );
 
-		return data.pipeline === undefined || data.version !== computeNode.version;
+		if ( data.pipeline === undefined || data.version !== computeNode.version ) return true;
+
+		if ( data.sharedKey !== undefined ) {
+
+			const shared = this.caches.get( data.sharedKey );
+
+			if ( shared !== undefined ) {
+
+				const sharedData = this.backend.get( shared );
+
+				return sharedData.pipeline !== undefined && sharedData.pipeline !== null;
+
+			}
+
+		}
+
+		return false;
 
 	}
 

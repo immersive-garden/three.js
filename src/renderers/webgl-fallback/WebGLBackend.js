@@ -1872,6 +1872,8 @@ class WebGLBackend extends Backend {
 		// Bindings (must be after link completion)
 		this._setupBindings( bindings, programGPU );
 
+		this.get( computePipeline ).pipeline = programGPU;
+
 	}
 
 	/**

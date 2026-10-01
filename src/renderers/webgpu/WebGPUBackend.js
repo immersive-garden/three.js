@@ -6,7 +6,8 @@ import { GPUFeatureName, GPULoadOp, GPUStoreOp, GPUIndexFormat, GPUTextureViewDi
 import WGSLNodeBuilder from './nodes/WGSLNodeBuilder.js';
 import Backend from '../common/Backend.js';
 
-import WebGPUUtils, { submit } from './utils/WebGPUUtils.js';
+import WebGPUUtils, { submit, flush, destroyResource } from './utils/WebGPUUtils.js';
+import WebGPUCommandQueue from './utils/WebGPUCommandQueue.js';
 import WebGPUAttributeUtils from './utils/WebGPUAttributeUtils.js';
 import WebGPUBindingUtils from './utils/WebGPUBindingUtils.js';
 import WebGPUCapabilities from './utils/WebGPUCapabilities.js';
@@ -113,6 +114,15 @@ class WebGPUBackend extends Backend {
 		 * @default null
 		 */
 		this.device = null;
+
+		/**
+		 * Defers command buffer submission per frame.
+		 *
+		 * @private
+		 * @type {?WebGPUCommandQueue}
+		 * @default null
+		 */
+		this._commandQueue = null;
 
 		/**
 		 * A reference to the default render pass descriptor.
@@ -263,7 +273,24 @@ class WebGPUBackend extends Backend {
 
 		}
 
+		this._commandQueue = WebGPUCommandQueue.get( device ) || new WebGPUCommandQueue( device );
+
+		this._commandQueue.onError = ( gpuError, message = null ) => {
+
+			renderer.onError( {
+				api: 'WebGPU',
+				type: gpuError.constructor ? gpuError.constructor.name : 'GPUError',
+				message: message || gpuError.message || 'Unknown GPU error in deferred submit',
+				originalEvent: null
+			} );
+
+		};
+
 		device.lost.then( ( info ) => {
+
+			const commandQueue = WebGPUCommandQueue.get( device );
+
+			if ( commandQueue !== null ) commandQueue.lose();
 
 			if ( info.reason === 'destroyed' ) return;
 
@@ -550,7 +577,7 @@ class WebGPUBackend extends Backend {
 
 			if ( textureData.msaaTextures !== undefined ) {
 
-				for ( const texture of textureData.msaaTextures ) texture.destroy();
+				for ( const texture of textureData.msaaTextures ) destroyResource( this.device, texture );
 
 				textureData.msaaTextures = undefined;
 
@@ -574,7 +601,7 @@ class WebGPUBackend extends Backend {
 
 			if ( textureData.msaaTextures !== undefined ) {
 
-				for ( const texture of textureData.msaaTextures ) texture.destroy();
+				for ( const texture of textureData.msaaTextures ) destroyResource( this.device, texture );
 
 			}
 
@@ -892,8 +919,8 @@ class WebGPUBackend extends Backend {
 
 		if ( occlusionQueryCount > 0 ) {
 
-			if ( renderContextData.currentOcclusionQuerySet ) renderContextData.currentOcclusionQuerySet.destroy();
-			if ( renderContextData.currentOcclusionQueryBuffer ) renderContextData.currentOcclusionQueryBuffer.destroy();
+			if ( renderContextData.currentOcclusionQuerySet ) destroyResource( device, renderContextData.currentOcclusionQuerySet );
+			if ( renderContextData.currentOcclusionQueryBuffer ) destroyResource( device, renderContextData.currentOcclusionQueryBuffer );
 
 			// Get a reference to the array of objects with queries. The renderContextData property
 			// can be changed by another render pass before the buffer.mapAsyc() completes.
@@ -923,7 +950,7 @@ class WebGPUBackend extends Backend {
 
 			renderContextData.lastOcclusionObject = undefined;
 
-			renderContextData.occlusionQuerySet.destroy();
+			destroyResource( device, renderContextData.occlusionQuerySet );
 			renderContextData.occlusionQuerySet = undefined;
 
 		}
@@ -1564,6 +1591,7 @@ class WebGPUBackend extends Backend {
 
 		submit( this.device, renderContextData.encoder.finish() );
 
+		if ( renderContext.textures === null && this._commandQueue !== null ) this._commandQueue.flush( true );
 
 		//
 
@@ -1625,6 +1653,8 @@ class WebGPUBackend extends Backend {
 
 			renderContextData.currentOcclusionQueryObjects = null;
 			renderContextData.currentOcclusionQueryBuffer = null;
+
+			flush( this.device );
 
 			await currentOcclusionQueryBuffer.mapAsync( GPUMapMode.READ );
 
@@ -1842,6 +1872,8 @@ class WebGPUBackend extends Backend {
 
 		submit( device, encoder.finish() );
 
+		if ( renderTargetContext === null && this._commandQueue !== null ) this._commandQueue.flush( true );
+
 	}
 
 	// compute
@@ -1894,7 +1926,12 @@ class WebGPUBackend extends Backend {
 
 		// pipeline
 
-		const pipelineGPU = this.get( pipeline ).pipeline;
+		const pipelineData = this.get( pipeline );
+
+		// Skip if pipeline has error, so one broken kernel does not invalidate the batch
+		if ( pipelineData.error === true ) return;
+
+		const pipelineGPU = pipelineData.pipeline;
 
 		if ( groupGPU.currentPipeline !== pipelineGPU ) {
 
@@ -2799,7 +2836,7 @@ class WebGPUBackend extends Backend {
 
 		const uniformBufferData = this.get( uniformBuffer );
 
-		uniformBufferData.buffer.destroy();
+		destroyResource( this.device, uniformBufferData.buffer );
 
 		this.delete( uniformBuffer );
 
@@ -3249,7 +3286,19 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Submits all deferred command buffers in one `queue.submit()` call.
+	 */
+	flush() {
+
+		if ( this._commandQueue !== null ) this._commandQueue.flush();
+
+	}
+
 	async dispose() {
+
+		// Submit deferred command buffers before their query sets and buffers are destroyed.
+		if ( this._commandQueue !== null ) this._commandQueue.flush( true );
 
 		await super.dispose();
 
@@ -3260,11 +3309,18 @@ class WebGPUBackend extends Backend {
 
 			for ( const buffer of this.occludedResolveCache.values() ) {
 
-				buffer.destroy();
+				destroyResource( this.device, buffer );
 
 			}
 
 			this.occludedResolveCache.clear();
+
+		}
+
+		if ( this._commandQueue !== null ) {
+
+			this._commandQueue.dispose();
+			this._commandQueue = null;
 
 		}
 
