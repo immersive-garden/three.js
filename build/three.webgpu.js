@@ -67706,30 +67706,17 @@ ${ flowData.code }
 
 			propertyName = this.getPropertyName( nodeVar );
 
-			// property size
+			// property size, inlined per element: a size variable cached per buffer is only assigned
+			// in the flow scope of its first use, so reads in another branch saw it uninitialized
 
-			const bufferNodeData = this.getDataFromNode( node );
-
-			let propertySizeName = bufferNodeData.propertySizeName;
-
-			if ( propertySizeName === undefined ) {
-
-				propertySizeName = propertyName + 'Size';
-
-				this.getVarFromNode( node, propertySizeName, 'uint' );
-
-				this.addLineFlowCode( `${ propertySizeName } = uint( textureSize( ${ textureName }, 0 ).x )`, storageArrayElementNode );
-
-				bufferNodeData.propertySizeName = propertySizeName;
-
-			}
+			const sizeSnippet = `uint( textureSize( ${ textureName }, 0 ).x )`;
 
 			//
 
 			const { itemSize } = attribute;
 
 			const channel = '.' + vectorComponents.join( '' ).slice( 0, itemSize );
-			const uvSnippet = `ivec2(${indexSnippet} % ${ propertySizeName }, ${indexSnippet} / ${ propertySizeName })`;
+			const uvSnippet = `ivec2(${indexSnippet} % ${ sizeSnippet }, ${indexSnippet} / ${ sizeSnippet })`;
 
 			const snippet = this.generateTextureLoad( null, textureName, uvSnippet, '0', null, null );
 
