@@ -44905,7 +44905,7 @@ class WorkgroupInfoNode extends Node {
 
 		}
 
-		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${this.id}`;
+		const name = ( this.name !== '' ) ? this.name : `${this.scope}Array_${ builder.getScopedArrayIndex( this ) }`;
 
 		return builder.getScopedArray( name, this.scope.toLowerCase(), this.bufferType, this.bufferCount, this.isAtomic );
 
@@ -53203,6 +53203,14 @@ class NodeBuilder {
 		this.bufferIndices = new Map();
 
 		/**
+		 * Per-builder indices of scoped array nodes (e.g. workgroup arrays), used to name
+		 * them independently of global node ids.
+		 *
+		 * @type {Map<Node,number>}
+		 */
+		this.scopedArrayIndices = new Map();
+
+		/**
 		 * The current shader stage.
 		 *
 		 * @type {?('vertex'|'fragment'|'compute'|'any')}
@@ -56057,6 +56065,29 @@ class NodeBuilder {
 			index = this.bufferIndices.size;
 
 			this.bufferIndices.set( node, index );
+
+		}
+
+		return index;
+
+	}
+
+	/**
+	 * Returns a deterministic per-builder index for the given scoped array node, assigned on
+	 * first request.
+	 *
+	 * @param {Node} node - The scoped array node.
+	 * @return {number} The index.
+	 */
+	getScopedArrayIndex( node ) {
+
+		let index = this.scopedArrayIndices.get( node );
+
+		if ( index === undefined ) {
+
+			index = this.scopedArrayIndices.size;
+
+			this.scopedArrayIndices.set( node, index );
 
 		}
 
