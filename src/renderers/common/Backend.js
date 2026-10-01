@@ -818,6 +818,12 @@ class Backend {
 	deleteBindGroupData( /*bindGroup*/ ) { }
 
 	/**
+	 * Submits GPU work the backend has deferred. A no-op for backends
+	 * that submit immediately.
+	 */
+	flush() { }
+
+	/**
 	 * Frees internal resources.
 	 *
 	 * @abstract

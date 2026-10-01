@@ -1,6 +1,6 @@
 import { error } from '../../../utils.js';
 import TimestampQueryPool from '../../common/TimestampQueryPool.js';
-import { submit } from './WebGPUUtils.js';
+import { submit, flush } from './WebGPUUtils.js';
 import GPUBufferDescriptor from '../descriptors/GPUBufferDescriptor.js';
 import GPUCommandEncoderDescriptor from '../descriptors/GPUCommandEncoderDescriptor.js';
 import GPUQuerySetDescriptor from '../descriptors/GPUQuerySetDescriptor.js';
@@ -173,6 +173,7 @@ class WebGPUTimestampQueryPool extends TimestampQueryPool {
 
 			const commandBuffer = commandEncoder.finish();
 			submit( this.device, commandBuffer );
+			flush( this.device );
 
 			if ( this.resultBuffer.mapState !== 'unmapped' ) {
 

@@ -2750,6 +2750,17 @@ class Renderer {
 	}
 
 	/**
+	 * Submits GPU work the backend has deferred. The WebGPU backend batches the
+	 * command buffers of a frame and submits them at the end of the task, so call
+	 * this to submit earlier, e.g. before timing GPU work.
+	 */
+	flush() {
+
+		if ( this._initialized === true ) this.backend.flush();
+
+	}
+
+	/**
 	 * Frees all internal resources of the renderer. Call this method if the renderer
 	 * is no longer in use by your app.
 	 */

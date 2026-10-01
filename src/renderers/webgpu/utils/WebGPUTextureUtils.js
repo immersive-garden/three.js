@@ -4,7 +4,7 @@ import {
 import { ColorManagement } from '../../../math/ColorManagement.js';
 
 import WebGPUTexturePassUtils from './WebGPUTexturePassUtils.js';
-import { submit } from './WebGPUUtils.js';
+import { submit, flush, destroyResource } from './WebGPUUtils.js';
 import GPUBufferDescriptor from '../descriptors/GPUBufferDescriptor.js';
 import GPUCommandEncoderDescriptor from '../descriptors/GPUCommandEncoderDescriptor.js';
 import GPUSamplerDescriptor from '../descriptors/GPUSamplerDescriptor.js';
@@ -483,13 +483,15 @@ class WebGPUTextureUtils {
 		const backend = this.backend;
 		const textureData = backend.get( texture );
 
-		if ( textureData.texture !== undefined && isDefaultTexture === false && texture.isExternalTexture !== true && textureData.externalTexture !== true ) textureData.texture.destroy();
+		const device = backend.device;
 
-		if ( textureData.msaaTexture !== undefined ) textureData.msaaTexture.destroy();
+		if ( textureData.texture !== undefined && isDefaultTexture === false && texture.isExternalTexture !== true && textureData.externalTexture !== true ) destroyResource( device, textureData.texture );
+
+		if ( textureData.msaaTexture !== undefined ) destroyResource( device, textureData.msaaTexture );
 
 		if ( textureData.msaaTextures !== undefined ) {
 
-			for ( const msaaTexture of textureData.msaaTextures ) msaaTexture.destroy();
+			for ( const msaaTexture of textureData.msaaTextures ) destroyResource( device, msaaTexture );
 
 		}
 
@@ -537,7 +539,7 @@ class WebGPUTextureUtils {
 
 		let colorBuffer = colorTextureData.texture;
 
-		if ( colorBuffer ) colorBuffer.destroy();
+		if ( colorBuffer ) destroyResource( backend.device, colorBuffer );
 
 		_textureDescriptor.label = 'colorBuffer';
 		_textureDescriptor.size.width = width;
@@ -845,6 +847,7 @@ class WebGPUTextureUtils {
 		const typedArrayType = this._getTypedArrayType( format );
 
 		submit( device, encoder.finish() );
+		flush( device );
 
 		await readBuffer.mapAsync( GPUMapMode.READ );
 
