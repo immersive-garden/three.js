@@ -33153,15 +33153,42 @@ class Pipelines extends DataMap {
 
 			// determine compute pipeline
 
-			const cacheKey = this._getComputeCacheKey( computeNode, stageCompute );
+			let cacheKey = this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 			let pipeline = this.caches.get( cacheKey );
+
+			if ( pipeline !== undefined && backend.isWebGPUBackend === true ) {
+
+				const pipelineData = backend.get( pipeline );
+
+				if ( pipelineData.pipeline === undefined ) {
+
+					if ( promises !== null ) {
+
+						if ( pipelineData.promise !== undefined && promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
+
+					} else {
+
+						// a shared pipeline that is still compiling (or failed) can't be dispatched now, so build a per-node one
+
+						cacheKey = computeNode.id + ',' + stageCompute.id;
+						pipeline = this.caches.get( cacheKey );
+
+					}
+
+				}
+
+			}
 
 			if ( pipeline === undefined ) {
 
 				if ( previousPipeline && previousPipeline.usedTimes === 0 ) this._releasePipeline( previousPipeline );
 
 				pipeline = this._getComputePipeline( computeNode, stageCompute, cacheKey, bindings, promises );
+
+			} else if ( previousPipeline && previousPipeline !== pipeline && previousPipeline.usedTimes === 0 ) {
+
+				this._releasePipeline( previousPipeline );
 
 			}
 
@@ -33380,7 +33407,7 @@ class Pipelines extends DataMap {
 
 		// check for existing pipeline
 
-		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute );
+		cacheKey = cacheKey || this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 		let pipeline = this.caches.get( cacheKey );
 
@@ -33438,14 +33465,37 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Computes a cache key representing a compute pipeline.
+	 * Computes a cache key representing a compute pipeline. On WebGPU, compute nodes with
+	 * the same shader program and equivalent bind group layouts share one pipeline. The
+	 * WebGL backend stores per-node state on the pipeline, so it keeps one per node.
 	 *
 	 * @private
 	 * @param {Node} computeNode - The compute node.
 	 * @param {ProgrammableStage} stageCompute - The programmable stage representing the compute shader.
+	 * @param {Array<BindGroup>} bindings - The bindings.
 	 * @return {string} The cache key.
 	 */
-	_getComputeCacheKey( computeNode, stageCompute ) {
+	_getComputeCacheKey( computeNode, stageCompute, bindings ) {
+
+		const { backend } = this;
+
+		if ( backend.isWebGPUBackend === true && bindings ) {
+
+			let layoutKey = '';
+
+			for ( const bindGroup of bindings ) {
+
+				const groupLayoutKey = backend.get( bindGroup ).layoutKey;
+
+				if ( groupLayoutKey === undefined ) return computeNode.id + ',' + stageCompute.id;
+
+				layoutKey += ',' + groupLayoutKey;
+
+			}
+
+			return 'shared:' + stageCompute.id + layoutKey;
+
+		}
 
 		return computeNode.id + ',' + stageCompute.id;
 
@@ -85996,11 +86046,15 @@ class WebGPUPipelineUtils {
 
 					// Guarantee resolution so `compileComputeAsync`'s Promise.all cannot hang on an
 					// unexpected throw from any await above.
+					pipelineGPU.promise = undefined;
+
 					resolve();
 
 				}
 
 			} );
+
+			pipelineGPU.promise = promise;
 
 			promises.push( promise );
 

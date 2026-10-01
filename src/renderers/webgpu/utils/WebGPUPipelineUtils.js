@@ -486,11 +486,15 @@ class WebGPUPipelineUtils {
 
 					// Guarantee resolution so `compileComputeAsync`'s Promise.all cannot hang on an
 					// unexpected throw from any await above.
+					pipelineGPU.promise = undefined;
+
 					resolve();
 
 				}
 
 			} );
+
+			pipelineGPU.promise = promise;
 
 			promises.push( promise );
 
