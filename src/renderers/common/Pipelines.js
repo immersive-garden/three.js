@@ -107,14 +107,19 @@ class Pipelines extends DataMap {
 
 			// programmable stage
 
-			let stageCompute = this.programs.compute.get( nodeBuilderState.computeShader );
+			// WebGPU stages only carry code and are shared; WebGL stages carry per-node transforms and attributes
+
+			const programKey = backend.isWebGPUBackend === true ? nodeBuilderState.computeShader : computeNode.id + ',' + nodeBuilderState.computeShader;
+
+			let stageCompute = this.programs.compute.get( programKey );
 
 			if ( stageCompute === undefined ) {
 
 				if ( previousPipeline && previousPipeline.computeProgram.usedTimes === 0 ) this._releaseProgram( previousPipeline.computeProgram );
 
 				stageCompute = new ProgrammableStage( nodeBuilderState.computeShader, 'compute', computeNode.name, nodeBuilderState.transforms, nodeBuilderState.nodeAttributes );
-				this.programs.compute.set( nodeBuilderState.computeShader, stageCompute );
+				stageCompute.cacheKey = programKey;
+				this.programs.compute.set( programKey, stageCompute );
 
 				backend.createProgram( stageCompute );
 				this.info.createProgram( stageCompute );
@@ -126,6 +131,8 @@ class Pipelines extends DataMap {
 			let cacheKey = this._getComputeCacheKey( computeNode, stageCompute, bindings );
 
 			let pipeline = this.caches.get( cacheKey );
+
+			data.sharedKey = undefined;
 
 			if ( pipeline !== undefined && backend.isWebGPUBackend === true ) {
 
@@ -141,6 +148,7 @@ class Pipelines extends DataMap {
 
 						// a shared pipeline that failed, or is still compiling for a sync caller, can't be dispatched, so build a per-node one
 
+						data.sharedKey = cacheKey;
 						cacheKey = computeNode.id + ',' + stageCompute.id;
 						pipeline = this.caches.get( cacheKey );
 
@@ -507,10 +515,10 @@ class Pipelines extends DataMap {
 	 */
 	_releaseProgram( program ) {
 
-		const code = program.code;
+		const key = program.cacheKey !== undefined ? program.cacheKey : program.code;
 		const stage = program.stage;
 
-		this.programs[ stage ].delete( code );
+		this.programs[ stage ].delete( key );
 
 		this.info.destroyProgram( program );
 
@@ -527,7 +535,23 @@ class Pipelines extends DataMap {
 
 		const data = this.get( computeNode );
 
-		return data.pipeline === undefined || data.version !== computeNode.version;
+		if ( data.pipeline === undefined || data.version !== computeNode.version ) return true;
+
+		if ( data.sharedKey !== undefined ) {
+
+			const shared = this.caches.get( data.sharedKey );
+
+			if ( shared !== undefined ) {
+
+				const sharedData = this.backend.get( shared );
+
+				return sharedData.pipeline !== undefined && sharedData.pipeline !== null;
+
+			}
+
+		}
+
+		return false;
 
 	}
 
