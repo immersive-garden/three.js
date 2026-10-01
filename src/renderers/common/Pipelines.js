@@ -133,13 +133,13 @@ class Pipelines extends DataMap {
 
 				if ( pipelineData.pipeline === undefined ) {
 
-					if ( promises !== null ) {
+					if ( promises !== null && pipelineData.promise !== undefined ) {
 
-						if ( pipelineData.promise !== undefined && promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
+						if ( promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
 
 					} else {
 
-						// a shared pipeline that is still compiling (or failed) can't be dispatched now, so build a per-node one
+						// a shared pipeline that failed, or is still compiling for a sync caller, can't be dispatched, so build a per-node one
 
 						cacheKey = computeNode.id + ',' + stageCompute.id;
 						pipeline = this.caches.get( cacheKey );
@@ -274,11 +274,11 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Checks if the render pipeline for the given render object is ready for drawing.
-	 * Returns false if the GPU pipeline is still being compiled asynchronously.
+	 * Checks if the pipeline for the given render object or compute node is ready for drawing
+	 * or dispatching. Returns false if the GPU pipeline is still being compiled asynchronously.
 	 *
-	 * @param {RenderObject} renderObject - The render object.
-	 * @return {boolean} True if the pipeline is ready for drawing.
+	 * @param {RenderObject|Node} renderObject - The render object or compute node.
+	 * @return {boolean} True if the pipeline is ready.
 	 */
 	isReady( renderObject ) {
 
@@ -355,10 +355,11 @@ class Pipelines extends DataMap {
 	 * Updates the pipeline for the given render object.
 	 *
 	 * @param {RenderObject} renderObject - The render object.
+	 * @param {?Array<Promise>} [promises=null] - If set, a new pipeline is created asynchronously and its promise is pushed here.
 	 */
-	updateForRender( renderObject ) {
+	updateForRender( renderObject, promises = null ) {
 
-		this.getForRender( renderObject );
+		this.getForRender( renderObject, promises );
 
 	}
 

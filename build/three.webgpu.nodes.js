@@ -33163,13 +33163,13 @@ class Pipelines extends DataMap {
 
 				if ( pipelineData.pipeline === undefined ) {
 
-					if ( promises !== null ) {
+					if ( promises !== null && pipelineData.promise !== undefined ) {
 
-						if ( pipelineData.promise !== undefined && promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
+						if ( promises.includes( pipelineData.promise ) === false ) promises.push( pipelineData.promise );
 
 					} else {
 
-						// a shared pipeline that is still compiling (or failed) can't be dispatched now, so build a per-node one
+						// a shared pipeline that failed, or is still compiling for a sync caller, can't be dispatched, so build a per-node one
 
 						cacheKey = computeNode.id + ',' + stageCompute.id;
 						pipeline = this.caches.get( cacheKey );
@@ -33304,11 +33304,11 @@ class Pipelines extends DataMap {
 	}
 
 	/**
-	 * Checks if the render pipeline for the given render object is ready for drawing.
-	 * Returns false if the GPU pipeline is still being compiled asynchronously.
+	 * Checks if the pipeline for the given render object or compute node is ready for drawing
+	 * or dispatching. Returns false if the GPU pipeline is still being compiled asynchronously.
 	 *
-	 * @param {RenderObject} renderObject - The render object.
-	 * @return {boolean} True if the pipeline is ready for drawing.
+	 * @param {RenderObject|Node} renderObject - The render object or compute node.
+	 * @return {boolean} True if the pipeline is ready.
 	 */
 	isReady( renderObject ) {
 
@@ -33385,10 +33385,11 @@ class Pipelines extends DataMap {
 	 * Updates the pipeline for the given render object.
 	 *
 	 * @param {RenderObject} renderObject - The render object.
+	 * @param {?Array<Promise>} [promises=null] - If set, a new pipeline is created asynchronously and its promise is pushed here.
 	 */
-	updateForRender( renderObject ) {
+	updateForRender( renderObject, promises = null ) {
 
-		this.getForRender( renderObject );
+		this.getForRender( renderObject, promises );
 
 	}
 
@@ -62404,6 +62405,16 @@ class Renderer {
 		this._compilationPromises = null;
 
 		/**
+		 * While not `null`, pipelines requested by `render()` and `compute()` are created
+		 * asynchronously and their promises are collected here. See `beginPipelineCollection()`.
+		 *
+		 * @private
+		 * @type {?Array<Promise>}
+		 * @default null
+		 */
+		this._pipelineCollection = null;
+
+		/**
 		 * Whether the renderer is currently precompiling a render object in
 		 * `compileAsync()`.
 		 *
@@ -64750,7 +64761,9 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const computePipeline = pipelines.getForCompute( computeNode, computeBindings );
+			const computePipeline = pipelines.getForCompute( computeNode, computeBindings, this._pipelineCollection );
+
+			if ( pipelines.isReady( computeNode ) === false ) continue;
 
 			backend.compute( computeNodes, computeNode, computeBindings, computePipeline, dispatchSize );
 
@@ -64786,6 +64799,32 @@ class Renderer {
 		if ( this._initialized === false ) await this.init();
 
 		this.compute( computeNodes, dispatchSize );
+
+	}
+
+	/**
+	 * Starts collecting pipeline creations. Until `endPipelineCollection()` is called, every
+	 * pipeline that `render()` or `compute()` needs is created asynchronously, in parallel,
+	 * and draws or dispatches using it are skipped until it is ready.
+	 */
+	beginPipelineCollection() {
+
+		this._pipelineCollection = [];
+
+	}
+
+	/**
+	 * Stops collecting pipeline creations started with `beginPipelineCollection()`.
+	 *
+	 * @return {Array<Promise>} The promises of the pipelines requested while collecting. They resolve also when creation fails.
+	 */
+	endPipelineCollection() {
+
+		const promises = this._pipelineCollection || [];
+
+		this._pipelineCollection = null;
+
+		return promises;
 
 	}
 
@@ -65680,7 +65719,7 @@ class Renderer {
 
 		}
 
-		this._pipelines.updateForRender( renderObject );
+		this._pipelines.updateForRender( renderObject, this._pipelineCollection );
 
 		//
 
@@ -65744,7 +65783,7 @@ class Renderer {
 		this._nodes.updateForRender( renderObject );
 		this._bindings.updateForRender( renderObject );
 
-		this._pipelines.getForRender( renderObject, this._compilationPromises );
+		this._pipelines.getForRender( renderObject, this._pipelineCollection );
 
 		this._nodes.updateAfter( renderObject );
 
@@ -75998,6 +76037,8 @@ class WebGLBackend extends Backend {
 
 		// Bindings (must be after link completion)
 		this._setupBindings( bindings, programGPU );
+
+		this.get( computePipeline ).pipeline = programGPU;
 
 	}
 

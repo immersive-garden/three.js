@@ -662,6 +662,16 @@ class Renderer {
 		this._compilationPromises = null;
 
 		/**
+		 * While not `null`, pipelines requested by `render()` and `compute()` are created
+		 * asynchronously and their promises are collected here. See `beginPipelineCollection()`.
+		 *
+		 * @private
+		 * @type {?Array<Promise>}
+		 * @default null
+		 */
+		this._pipelineCollection = null;
+
+		/**
 		 * Whether the renderer is currently precompiling a render object in
 		 * `compileAsync()`.
 		 *
@@ -3008,7 +3018,9 @@ class Renderer {
 			bindings.updateForCompute( computeNode );
 
 			const computeBindings = bindings.getForCompute( computeNode );
-			const computePipeline = pipelines.getForCompute( computeNode, computeBindings );
+			const computePipeline = pipelines.getForCompute( computeNode, computeBindings, this._pipelineCollection );
+
+			if ( pipelines.isReady( computeNode ) === false ) continue;
 
 			backend.compute( computeNodes, computeNode, computeBindings, computePipeline, dispatchSize );
 
@@ -3044,6 +3056,32 @@ class Renderer {
 		if ( this._initialized === false ) await this.init();
 
 		this.compute( computeNodes, dispatchSize );
+
+	}
+
+	/**
+	 * Starts collecting pipeline creations. Until `endPipelineCollection()` is called, every
+	 * pipeline that `render()` or `compute()` needs is created asynchronously, in parallel,
+	 * and draws or dispatches using it are skipped until it is ready.
+	 */
+	beginPipelineCollection() {
+
+		this._pipelineCollection = [];
+
+	}
+
+	/**
+	 * Stops collecting pipeline creations started with `beginPipelineCollection()`.
+	 *
+	 * @return {Array<Promise>} The promises of the pipelines requested while collecting. They resolve also when creation fails.
+	 */
+	endPipelineCollection() {
+
+		const promises = this._pipelineCollection || [];
+
+		this._pipelineCollection = null;
+
+		return promises;
 
 	}
 
@@ -3938,7 +3976,7 @@ class Renderer {
 
 		}
 
-		this._pipelines.updateForRender( renderObject );
+		this._pipelines.updateForRender( renderObject, this._pipelineCollection );
 
 		//
 
@@ -4002,7 +4040,7 @@ class Renderer {
 		this._nodes.updateForRender( renderObject );
 		this._bindings.updateForRender( renderObject );
 
-		this._pipelines.getForRender( renderObject, this._compilationPromises );
+		this._pipelines.getForRender( renderObject, this._pipelineCollection );
 
 		this._nodes.updateAfter( renderObject );
 
